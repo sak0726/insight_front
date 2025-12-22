@@ -19,16 +19,7 @@ import base64
 from insight_db import get_data
 import re
 
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE env vars are not set")
-
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY
-)
+supabase = None
 _clip_model = None
 _clip_preprocess = None
 
@@ -86,7 +77,7 @@ app.mount("/output", StaticFiles(directory="output"), name="output")
 @app.post("/warmup")
 async def warmup():
     print("🧠 モデルウォームアップ")
-    global intelligent_analyzer
+    global intelligent_analyzer, supabase
     try:
         if intelligent_analyzer is None:
             print("🧠 Loading AI Models (IntelligentPDFAnalyzer)...")
@@ -96,7 +87,30 @@ async def warmup():
         get_cpu_clip()
         intelligent_analyzer.load_faiss_shard("001")
 
+        SUPABASE_URL = os.getenv("SUPABASE_URL")
+        SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            logger.warning("SUPABASE env vars are not set. Supabase disabled.")
+            supabase = None
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "partial",
+                    "message": "Models loaded, Supabase disabled"
+                }
+            )
+
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
         logger.info("🧠 モデルウォームアップ完了")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ok",
+                "message": "Models and Supabase ready"
+            }
+        )
 
 
         return JSONResponse(content={
