@@ -1,0 +1,31 @@
+# Web Framework
+fastapi
+uvicorn[standard]
+python-multipart
+httpx
+
+# Database & Storage
+supabase
+boto3
+python-dotenv
+postgrest
+
+# Google AI SDK
+google-genai
+
+# Image & PDF Processing
+opencv-python-headless
+numpy
+Pillow
+pymupdf
+pdf2image
+
+# AI & Vector Search
+torch --extra-index-url https://download.pytorch.org/whl/cpu
+torchvision --extra-index-url https://download.pytorch.org/whl/cpu
+open_clip_torch
+faiss-cpu
+
+# Utilities
+pandas
+requests
