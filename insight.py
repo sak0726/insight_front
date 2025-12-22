@@ -14,12 +14,8 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 import logging
-from vector_db import init_vector_db
-from config_manager import config_manager, get_config, is_production
-from vector_db import load_all_vectors
 import faiss
 import base64
-from contextlib import asynccontextmanager
 from insight_db import get_data
 import re
 
@@ -59,8 +55,6 @@ intelligent_analyzer = None
 clip_engine = None
 
     
-app_config = config_manager.get_performance_config()
-
 logger = logging.getLogger(__name__)
 
 # 🚀 FastAPI アプリケーション設定
@@ -68,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 # CORS設定
-cors_origins = get_config('api.cors_origins', ["*"])
+cors_origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -687,129 +681,8 @@ def cosine_similarity(v1, v2):
     n2 = np.linalg.norm(v2)
     if n1 == 0 or n2 == 0:
         return 0.0
-    return float(np.dot(v1, v2) / (n1 * n2))
+    return float(np.dot(v1, v2) / (n1 * n2))    
 
-
-async def perform_similarity_search(query_vecs, search_type: str) -> List[Dict[str, Any]]:
-
-    import numpy as np
-
-    try:
-        logger.info(f"🎯 {search_type} - 類似度計算開始")
-
-        # クエリベクトルだけ取り出す
-        qvecs = [vec.astype("float32") for (_, vec) in query_vecs]
-        if not qvecs:
-            raise RuntimeError("query_vecs が空です")
-
-        # ベクトルDBを全文取得
-        entries = load_all_vectors()
-        logger.info(f"📁 ベクトルDB件数: {len(entries)}")
-
-        # 図面フォルダ単位でスコア集計
-        aggregated = {}  # folder → total_score
-
-        for entry in entries:
-            target_vec = entry["vector"].astype("float32")
-
-            # クエリ複数 → 最大スコア or 平均？  
-            # 「複数切り抜きで一致した図面を優遇」なので **合計（加点方式）** が最適
-            max_score = 0.0
-            for qv in qvecs:
-                denom = np.linalg.norm(qv) * np.linalg.norm(target_vec)
-                score = float(np.dot(qv, target_vec) / denom) if denom > 0 else 0.0
-                if score > max_score:
-                    max_score = score
-
-            page_path = Path(entry["page_path"])
-            folder_name = page_path.name
-
-            if folder_name not in aggregated:
-                aggregated[folder_name] = max_score
-            else:
-                aggregated[folder_name] = max(aggregated[folder_name], max_score)
-
-        # ソート（降順）
-        sorted_items = sorted(aggregated.items(), key=lambda x: x[1], reverse=True)
-
-        # UI result_item 構築（既存形式/絶対厳守）
-        results = []
-        for folder_name, score in sorted_items:
-            pdf_file = f"uploads/{folder_name}/{folder_name}.pdf"
-            img_file = f"uploads/{folder_name}/fullpage.png"
-
-            explanation = {
-                "confidence_level": "vector_db_clip",
-                "dominant_features": ["clip_vector"],
-                "breakdown": {"similarity": score}
-            }
-
-            result_item = {
-                "pdf": pdf_file,
-                "img": [{
-                    "imgFile": img_file,
-                    "similarity": score,
-                    "explanation": explanation,
-                    "rotation_applied": 0.0
-                }],
-                "revolutionary_analysis": {
-                    "confidence": explanation["confidence_level"],
-                    "dominant_features": explanation["dominant_features"],
-                    "breakdown": explanation["breakdown"]
-                }
-            }
-
-            results.append(result_item)
-
-        logger.info(f"✅ {search_type} 完了: {len(results)}件")
-        return results
-
-    except Exception as e:
-        logger.error(f"❌ 類似度検索エラー: {str(e)}")
-        return []
-    
-
-
-async def handle_manual_search(images: List[UploadFile]) -> SearchResponse:
-    import cv2
-    from intelligent_pdf_analyzer import parts_bytes_image
-
-    logger.info("gatou", images)
-    temp_paths = []
-    try:
-        if not images:
-            raise HTTPException(status_code=400, detail="画像ファイルが必要です")
-        query_vecs = []
-        for up in images:
-            temp_path = COMPARE_DIR / up.filename
-            content = await up.read()
-            with open(temp_path, "wb") as f:
-                f.write(content)
-            temp_paths.append(temp_path)
-
-            img = cv2.imread(str(temp_path))
-            if img is None:
-                continue
-            #query_vec = clip_engine.encode_image(img)
-            query_vecs = []
-            query_vecs.append((temp_path, query_vec))
-            
-        if not query_vecs:
-            raise HTTPException(status_code=400, detail="有効な画像が見つかりません")
-
-            # ③ perform_similarity_search に渡す
-        filtered_results = await perform_similarity_search(
-            query_vecs, "手動検索"
-        )
-        return SearchResponse(results=filtered_results, success=True)
-    except Exception as e:
-        logger.error(f"❌ 手動検索エラー: {str(e)}")
-        return SearchResponse(results=[], success=False)
-    finally:
-        
-        for temp_path in temp_paths:
-            if temp_path.exists():
-                temp_path.unlink()
 
 
 

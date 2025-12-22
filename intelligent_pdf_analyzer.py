@@ -16,7 +16,6 @@ import logging
 import time
 from PIL import Image
 import pandas as pd
-from postgrest import ReturnMethod
 from regex import F
 from gemiocr import run_gemi
 import requests
