@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
@@ -24,5 +24,4 @@ COPY . .
 
 # ディレクトリ作成
 RUN mkdir -p public/uploads public/compares output
-
-CMD ["uvicorn", "insight:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "insight:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "debug"]

@@ -1,12 +1,11 @@
 # main.py - 製造図面解析システム v3.0 統合版
 
-import cv2
+#import cv2
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional, Dict, Any, Tuple
-from supabase import create_client
 import asyncio
 import os
 import json
@@ -14,10 +13,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone
 import logging
-import faiss
 import base64
-from insight_db import get_data
-import re
 
 supabase = None
 _clip_model = None
@@ -78,6 +74,7 @@ app.mount("/output", StaticFiles(directory="output"), name="output")
 async def warmup():
     print("🧠 モデルウォームアップ")
     global intelligent_analyzer, supabase
+    from supabase import create_client
     try:
         if intelligent_analyzer is None:
             print("🧠 Loading AI Models (IntelligentPDFAnalyzer)...")
@@ -86,7 +83,9 @@ async def warmup():
 
         get_cpu_clip()
         intelligent_analyzer.load_faiss_shard("001")
-
+        import faiss
+        import faiss.contrib.torch_utils
+        logger.info("faiss imported successfully")
         SUPABASE_URL = os.getenv("SUPABASE_URL")
         SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -123,33 +122,17 @@ async def warmup():
         raise HTTPException(status_code=500, detail=f"ウォームアップエラー: {str(e)}")
 
 
+def is_production():
+    return os.getenv("K_SERVICE") is not None
+
 from pydantic import BaseModel
 # 🚀 メインAPIエンドポイント
 # ========================
 from pathlib import Path
     
 @app.get("/")
-async def root():
-    """🏠 システム情報"""
-    return {
-        "system": "製造図面解析システム",
-        "version": "3.0.0",
-        "status": "運用中",
-        "environment": "プロダクション" if is_production() else "開発",
-        "features": [
-            "📄 高精度PDF図面解析",
-            "🤖 ML自動タグ分類",
-            "🎯 候補選択システム", 
-            "⚡ プロダクション品質",
-            "🔍 類似図面検索"
-        ],
-        "endpoints": {
-            "analyze": "/api/analyze-pdf",
-            "search": "/api/search-drawings",
-            "health": "/health",
-            "metrics": "/api/metrics"
-        }
-    }
+def health():
+    return {"status": "ok"}
 
 @app.get("/page_image/{page_number}")
 async def get_page_image(page_number: int):
@@ -255,30 +238,7 @@ def rotate_image(img, angle):
         return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return img
 
-def _bottom_ratio_score(img):
-    import cv2
-    import numpy as np
 
-    """
-    下 / 上 の黒密度比を返す。
-    テーブルが下に来た角度だけ極端に跳ねるので、
-    これで正位置を見抜く。
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # 線を確実に拾うため180で二値化
-    _, th = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
-
-    h = th.shape[0]
-
-    # 上30% / 下30%
-    top_band    = th[0:int(h * 0.30), :]
-    bottom_band = th[int(h * 0.70):h, :]
-
-    top_black = int(np.sum(top_band > 0))
-    bottom_black = int(np.sum(bottom_band > 0))
-
-    return bottom_black / (top_black + 1)
 
 @app.get("/health")
 async def health_check():
@@ -381,6 +341,8 @@ async def split_pdf(pdf: UploadFile = File(...)):
 @app.post("/save")
 async def save_files(pdf: List[UploadFile] = File(...), images: Optional[List[UploadFile]] = File(None), totalSets: int = Form(1), batchId: str = Form(...)):
     print ("🚀 /保存添付ID:", batchId)
+    import re
+
     try:
         # 1. データのメモリ読み込み (非同期処理)
         if not pdf:
@@ -424,6 +386,7 @@ async def save_files(pdf: List[UploadFile] = File(...), images: Optional[List[Up
 def faiss_search(query_vec_torch, top_k=10):
     import faiss
     import faiss.contrib.torch_utils  # torch Tensor 対応を有効化
+    from insight_db import get_data
 
     if intelligent_analyzer is None:
         raise HTTPException(
@@ -466,6 +429,7 @@ def faiss_search(query_vec_torch, top_k=10):
 def faiss_search_single(query_vec_torch, top_k=10):
     import faiss
     import faiss.contrib.torch_utils  # torch Tensor 対応を有効化
+    from insight_db import get_data
 
     if intelligent_analyzer is None:
         raise HTTPException(
@@ -600,7 +564,7 @@ async def handle_auto_full_search(pdf_bytes: bytes, filename: str) -> SearchResp
     import torch
     from PIL import Image
     from intelligent_pdf_analyzer import pdf_bytes_to_raw_image
-
+    import cv2
     model, preprocess = get_cpu_clip()
 
     try:
@@ -702,6 +666,11 @@ def cosine_similarity(v1, v2):
 
 @app.get("/data_list")
 async def get_data_list(limit: int = 20, offset: int = 0):
+    if supabase is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase is not initialized. Call /warmup first."
+        )
     resp = (
         supabase
         .table("drawings")
@@ -767,9 +736,8 @@ async def get_data_list(limit: int = 20, offset: int = 0):
         "items": items,
         "total": total,
     }
-    
 def build_public_url(path: str) -> str:
     r2_bucket_url = os.getenv("R2_PUBLIC_URL")
     if not r2_bucket_url:
-        raise RuntimeError("r2.public_url is not configured")
+        raise HTTPException(503, "R2 is not configured")
     return f"{r2_bucket_url}/{path}"
