@@ -77,8 +77,11 @@ async def warmup():
     from supabase import create_client
     try:
         if intelligent_analyzer is None:
+            import importlib
+            module = importlib.import_module("intelligent_pdf_analyzer")
+            IntelligentPDFAnalyzer = module.IntelligentPDFAnalyzer
             print("🧠 Loading AI Models (IntelligentPDFAnalyzer)...")
-            from intelligent_pdf_analyzer import IntelligentPDFAnalyzer
+            #from intelligent_pdf_analyzer import IntelligentPDFAnalyzer
             intelligent_analyzer = IntelligentPDFAnalyzer()
 
         get_cpu_clip()
@@ -110,12 +113,6 @@ async def warmup():
                 "message": "Models and Supabase ready"
             }
         )
-
-
-        return JSONResponse(content={
-            "status": "ok",
-            "message": "モデルウォームアップ完了"
-        })
 
     except Exception as e:
         logger.error(f"❌ ウォームアップエラー: {e}")
@@ -563,10 +560,13 @@ async def handle_auto_full_search(pdf_bytes: bytes, filename: str) -> SearchResp
     """🤖 FAISS を使った全自動PDF検索（UI完全互換版）"""
     import torch
     from PIL import Image
-    from intelligent_pdf_analyzer import pdf_bytes_to_raw_image
+    #from intelligent_pdf_analyzer import pdf_bytes_to_raw_image
     import cv2
     model, preprocess = get_cpu_clip()
+    import importlib
 
+    module = importlib.import_module("intelligent_pdf_analyzer")
+    pdf_bytes_to_raw_image = module.pdf_bytes_to_raw_image
     try:
         logger.info(f"🚀 全自動PDF解析開始: {filename}")
         # -----------------------
@@ -599,8 +599,11 @@ async def handle_auto_full_search(pdf_bytes: bytes, filename: str) -> SearchResp
 async def handle_single_part_search(images: List[UploadFile]) -> SearchResponse:
     from fastapi import HTTPException
     import torch
-    from intelligent_pdf_analyzer import parts_bytes_image
+    #from intelligent_pdf_analyzer import parts_bytes_image
+    import importlib
 
+    module = importlib.import_module("intelligent_pdf_analyzer")
+    parts_bytes_image = module.parts_bytes_image
     # 1. warmup / モデルロード確認
     if intelligent_analyzer is None:
         raise HTTPException(status_code=503, detail="System not warmed up.")
