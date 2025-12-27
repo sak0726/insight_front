@@ -16,6 +16,7 @@ import logging
 import time
 from PIL import Image
 import pandas as pd
+from postgrest import ReturnMethod
 from regex import F
 from gemiocr import run_gemi
 import requests
@@ -31,7 +32,7 @@ import unicodedata
 from botocore.exceptions import ClientError
 import faiss
 import tempfile
-from insight_db import save_ocr_revision, check_batch, save_revision_tags, batch_clear
+from insight_db import save_ocr_revision, check_batch, save_revision_tags, batch_clear, check_batcha
 
 from dotenv import load_dotenv  # ← 追加
 load_dotenv()
@@ -134,7 +135,7 @@ def crop_to_content(img: np.ndarray) -> np.ndarray:
     h = min(h_img - y, h + pad_h * 2)
 
     return img[y:y+h, x:x+w]
-def auto_rotate_image_90deg(img: np.ndarray) -> tuple[np.ndarray, int]:
+def auto_rotate_image(img: np.ndarray) -> tuple[np.ndarray, int]:
     if img is None:
         return img, 0
 
@@ -156,37 +157,61 @@ def auto_rotate_image_90deg(img: np.ndarray) -> tuple[np.ndarray, int]:
         gray = small
     
     # 文字や線を白(255)にする
-    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV+ cv2.THRESH_OTSU)
 
     scores = {}
     
-    # 3. 4方向ループ（判定用画像でスコア計算）
     for angle in [0, 90, 180, 270]:
-        if angle == 0:   r_img = binary
-        elif angle == 90:  r_img = cv2.rotate(binary, cv2.ROTATE_90_CLOCKWISE)
-        elif angle == 180: r_img = cv2.rotate(binary, cv2.ROTATE_180)
-        elif angle == 270: r_img = cv2.rotate(binary, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        
+        # -----------------------------
+        # 回転（判定用 binary）
+        # -----------------------------
+        if angle == 0:
+            r_img = binary
+        elif angle == 90:
+            r_img = cv2.rotate(binary, cv2.ROTATE_90_CLOCKWISE)
+        elif angle == 180:
+            r_img = cv2.rotate(binary, cv2.ROTATE_180)
+        elif angle == 270:
+            r_img = cv2.rotate(binary, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
         h_r, w_r = r_img.shape
 
-        # --- 評価A: テキストの水平性 ---
-        sobel_y = cv2.Sobel(r_img, cv2.CV_64F, 0, 1)
-        score_horizontal = np.sum(np.abs(sobel_y))
+        # =====================================================
+        # 評価A: 横方向の文字・寸法線密度（90/270 排除用）
+        # =====================================================
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+        horizontal_lines = cv2.morphologyEx(r_img, cv2.MORPH_OPEN, kernel_h)
+        score_horizontal = cv2.countNonZero(horizontal_lines)
 
-        # --- 評価B: 右下重心（表題欄） ---
-        roi_h, roi_w = int(h_r * 0.3), int(w_r * 0.3)
-        bottom_right = r_img[h_r - roi_h:, w_r - roi_w:]
-        top_left = r_img[:roi_h, :roi_w]
-        
-        score_density = cv2.countNonZero(bottom_right) - cv2.countNonZero(top_left)
+        # =====================================================
+        # 評価B: 下部全体の情報密度（表題欄位置ゆらぎ対応）
+        # =====================================================
+        bottom = r_img[int(h_r * 0.7):, :]
+        top = r_img[:int(h_r * 0.3), :]
+        score_density = cv2.countNonZero(bottom) - cv2.countNonZero(top)
 
-        # 重み付け: 表題欄の位置(5.0) > 文字の流れ(1.0)
-        final_score = (score_horizontal * 1.0) + (score_density * 5.0)
+        # =====================================================
+        # 評価C: 図面枠の縦横比（補助）
+        # =====================================================
+        aspect_ratio = w_r / h_r  # 正方向は >1 になりやすい
+
+        rb = r_img[int(h_r * 0.6):, int(w_r * 0.6):]
+        score_rb = cv2.countNonZero(rb)
+        # =====================================================
+        # 総合スコア（重み確定）
+        # =====================================================
+        final_score = (
+            score_density * 2.5 +
+            score_horizontal * 1.5 +
+            aspect_ratio * 1.0 +
+            score_rb * 3.0      # ★ 右下重視（最重要）
+        )
+
         scores[angle] = final_score
 
     # 4. ベストな角度を決定
     best_angle = max(scores.items(), key=lambda x: x[1])[0]
-    logger.info(f"🧭 回転スコア: {scores} -> Selected: {best_angle}")
+    #logger.info(f"🧭 回転スコア: {scores} -> Selected: {best_angle}")
     if best_angle == 0:
         out_img = img
     elif best_angle == 90:
@@ -198,32 +223,10 @@ def auto_rotate_image_90deg(img: np.ndarray) -> tuple[np.ndarray, int]:
     else:
         out_img = img
 
-    # -----------------------------------------------------------
-    # 🛠️ デバッグ保存（return 前）
-    # -----------------------------------------------------------
-    timestamp = int(time.time())
-    debug_filename = f"auto_{timestamp}_angle{best_angle}.jpg"
-    cv2.imwrite(debug_filename, out_img)
-    print(f"[DEBUG] 回転確認用画像を保存しました: {debug_filename}")
+    #ok, buf = cv2.imencode(".jpg", out_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
     return out_img, best_angle
-    # 5. 【重要】判定結果に基づき、「元の高画質画像(img)」を回転して返す
-    if best_angle == 0:   return img, 0
-    elif best_angle == 90:  return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE), 90
-    elif best_angle == 180: return cv2.rotate(img, cv2.ROTATE_180), 180
-    elif best_angle == 270: return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE), 270
 
-        # -----------------------------------------------------------
-    # 🛠️【デバッグ保存】ここで回転後の画像を保存して確認する
-    # -----------------------------------------------------------
-    timestamp = int(time.time())
-    # ファイル名に「角度」も含めると、判定結果もわかって便利です
-    debug_filename = f"auto_{timestamp}_angle{best_angle}.jpg"
-    
-    cv2.imwrite(debug_filename, img)
-    print(f"[DEBUG] 回転確認用画像を保存しました: {debug_filename}")
-
-    return img, best_angle
 def image_to_ocr_pdf(img: np.ndarray, jpeg_quality=85) -> bytes:
     import fitz
     import cv2
@@ -252,11 +255,6 @@ def sanitize(value):
         return ""
     return value
 
-def gptocr(pdf_path: str) -> dict:
-    """GPT-OCRで図面OCR解析"""
-    result = run_gpt_ocr(pdf_path)
-    print(f"GPT-OCR結果: {result}")
-    return result
 
 # -----------------------------
 # PDF bytes → 低解像度画像
@@ -512,14 +510,9 @@ def parts_bytes_image(image_bytes: bytes) -> Image.Image:
 
 def pdf_bytes_to_raw_image(
     pdf_bytes: bytes,
-    dpi: int = 300
-) -> Tuple[np.ndarray, str]:
-    """
-    回転判定・比較専用
-    ・リサイズなし
-    ・JPEG圧縮なし
-    ・前処理なし
-    """
+    dpi: int = 150
+) -> Tuple[np.ndarray, str, int]:
+
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
 
@@ -535,9 +528,27 @@ def pdf_bytes_to_raw_image(
         img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
     elif pix.n == 3:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    
+    img, angle = auto_rotate_image(img)
+    
+    h, w = img.shape[:2]
+    max_side = max(h, w)
+    if max_side > 1024:
+        scale = 1024 / max_side
+        img = cv2.resize(
+            img,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA
+    )
+    #テスト出力
+    ts = int(time.time()*1000)
+    cv2.imwrite(f"auto_{ts}_final.jpg", img)
 
     doc.close()
-    return img, hashlib.sha256(img_bytes).hexdigest()[:16]
+    return img, hashlib.sha256(img_bytes).hexdigest()[:16], angle
+
+def pdf_bytes_to_sha(img_bytes: bytes) -> str:
+    return hashlib.sha256(img_bytes).hexdigest()[:16]
 
 def normalize_labels(ocr_result: dict) -> dict:
     dn = ocr_result.get("drawing_number", {})
@@ -572,7 +583,7 @@ def decide_drawing_uid(pdf_sha256):
 
 
 
-def build_faiss_index_from_vector_items(
+def xbuild_faiss_index_from_vector_items(
     vector_items: list[dict],
     shard_id: str,
     upload_func,
@@ -665,10 +676,154 @@ def build_faiss_index_from_vector_items(
                 "application/json"
             )
 
+
+def xbuild_faiss_index_from_vector_items(
+    vector_items: list[dict],
+    shard_id: str,
+    upload_func,
+) -> None:
+    if not vector_items:
+        raise ValueError("vector_items is empty")
+
+    # --------------------------------------------------
+    # 0. 順序をここで確定（最重要）
+    # --------------------------------------------------
+    # offset を必須とし、必ず昇順に並べる
+    try:
+        vector_items = sorted(vector_items, key=lambda x: x["offset"])
+    except KeyError:
+        raise RuntimeError("vector_items must include 'offset'")
+
+    # --------------------------------------------------
+    # 1. vectors を FAISS 用 ndarray に変換
+    # --------------------------------------------------
+    vectors = np.vstack(
+        [item["vector"] for item in vector_items]
+    ).astype("float32")
+
+    dim = vectors.shape[1]
+    if dim != 512:
+        raise ValueError(f"Invalid vector dim: {dim}")
+
+    # cosine 類似度
+    faiss.normalize_L2(vectors)
+
+    # --------------------------------------------------
+    # 2. FAISS index 構築
+    # --------------------------------------------------
+    index = faiss.IndexFlatIP(dim)
+    index.add(vectors)
+
+    # --------------------------------------------------
+    # 3. mapping.json 構築
+    # --------------------------------------------------
+    mapping_items = []
+
+    for vector_id, item in enumerate(vector_items):
+        image_key = item.get("image_key")
+        if not image_key and item["role"] == "main":
+            image_key = f'{item["base_dir"]}/fullpage.jpg'
+
+        entry = {
+            "vector_id": vector_id,
+            "drawing_uid": item["drawing_uid"],
+            "role": item["role"],
+            "base_dir": item["base_dir"],
+            "image_key": image_key,  # ★ main も含める
+        }
+
+        if item["role"] == "part":
+            entry.update({
+                "part_id": item["part_id"],
+                "page": item["page"],
+                "bbox": item["bbox"],
+            })
+
+        mapping_items.append(entry)
+
+    mapping = {
+        "version": 1,
+        "dim": dim,
+        "metric": "cosine",
+        "shard_id": shard_id,
+        "count": len(mapping_items),
+        "items": mapping_items,
+    }
+
+    # --------------------------------------------------
+    # 4. atomic write
+    # --------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        faiss_path = os.path.join(tmp, "faiss.index")
+        mapping_path = os.path.join(tmp, "mapping.json")
+
+        faiss.write_index(index, faiss_path)
+        with open(mapping_path, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=2)
+
+        with open(faiss_path, "rb") as f:
+            upload_func(
+                f.read(),
+                f"index/shards/{shard_id}/faiss.index",
+                "application/octet-stream"
+            )
+
+        with open(mapping_path, "rb") as f:
+            upload_func(
+                f.read(),
+                f"index/shards/{shard_id}/mapping.json",
+                "application/json"
+            )
+
+def build_faiss_index_from_vector_items(
+    vector_items: list[dict],
+    shard_id: str,
+    s3,
+    bucket_name: str,
+):
+    # offset 昇順で保証
+    vector_items.sort(key=lambda x: x["offset"])
+
+    vectors = np.vstack([v["vector"] for v in vector_items]).astype("float32")
+
+    # L2 normalize
+    faiss.normalize_L2(vectors)
+
+    index = faiss.IndexFlatIP(vectors.shape[1])
+    index.add(vectors)
+
+    # faiss.index 保存
+    faiss_bytes = bytes(faiss.serialize_index(index))
+    faiss_key = f"index/shards/{shard_id}/faiss.index"
+
+    s3.put_object(
+        Bucket=bucket_name,
+        Key=faiss_key,
+        Body=faiss_bytes,
+        ContentType="application/octet-stream",
+    )
+
+    # mapping.json 保存
+    mapping = [
+        {k: v for k, v in item.items() if k != "vector"}
+        for item in vector_items
+    ]
+
+    mapping_key = f"index/shards/{shard_id}/mapping.json"
+    s3.put_object(
+        Bucket=bucket_name,
+        Key=mapping_key,
+        Body=json.dumps(mapping, ensure_ascii=False, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+    logger.info(f"✅ FAISS rebuilt: shard={shard_id}, vectors={len(vector_items)}")
+
+
 def build_vector_order(vision: dict) -> list[str]:
     ids = [f"{vision['base_dir']}:main"]
     for part in vision.get("parts", []):
-        ids.append(part["part_id"])
+        ids.append(part["part_id"])  # ← part_id ではない
     return ids
 
 def assemble_vector_items(
@@ -685,6 +840,7 @@ def assemble_vector_items(
     # --- main ---
     main_vec = vectors[0]["vector"]
     vector_items.append({
+        "offset": 0,
         "drawing_uid": meta_data["drawing_uid"],
         "role": "main",
         "part_id": None,
@@ -696,11 +852,12 @@ def assemble_vector_items(
     parts = meta_data.get("parts", [])
     assert len(parts) == len(vectors) - 1, "parts数とvector数が不一致"
 
-    for part, vec_item in zip(parts, vectors[1:]):
+    for i, (part, vec_item) in enumerate(zip(parts, vectors[1:])):
         # 保険：順序保証が崩れたら即落とす
         assert part["part_id"] == vec_item["id"]
 
         vector_items.append({
+            "offset": i ,
             "drawing_uid": meta_data["drawing_uid"],
             "role": "part",
             "part_id": part["part_id"],
@@ -725,6 +882,8 @@ def make_fullpage_jpeg_from_img(rawimg: np.ndarray) -> bytes:
         raise RuntimeError("JPEG encode failed")
 
     return buf.tobytes()
+
+
 def make_fullpage_jpeg_from_pdf(pdf_bytes: bytes, ts: int) -> bytes:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
@@ -733,12 +892,14 @@ def make_fullpage_jpeg_from_pdf(pdf_bytes: bytes, ts: int) -> bytes:
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
         pix.h, pix.w, pix.n
     )
-
+    
     if pix.n == 4:
         img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
     else:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
+    img, angle = auto_rotate_image(img)
+    
     h, w = img.shape[:2]
     scale = 1024 / max(h, w)
     if scale < 1.0:
@@ -750,7 +911,7 @@ def make_fullpage_jpeg_from_pdf(pdf_bytes: bytes, ts: int) -> bytes:
     if not ok:
         raise RuntimeError("JPEG encode failed")
 
-    return buf.tobytes()
+    return buf.tobytes(), angle
 
 def rotate_pdf_bytes(pdf_bytes: bytes, angle: int) -> bytes:
     if angle == 0:
@@ -763,6 +924,89 @@ def rotate_pdf_bytes(pdf_bytes: bytes, angle: int) -> bytes:
     rotated_bytes = doc.tobytes(garbage=4, deflate=True)
     doc.close()
     return rotated_bytes
+
+def connect_r2():
+    return boto3.client(
+        "s3",
+        endpoint_url=os.getenv("R2_ENDPOINT_URL"),
+        aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"),
+        region_name="auto",
+    )
+def rebuild_faiss():
+    s3 = connect_r2()
+    bucket_name = os.getenv("R2_BUCKET_NAME")
+
+    # 1. drawings/**/index.json を全列挙
+    keys = list_keys_from_r2(s3, bucket_name, prefix="drawings/")
+    index_keys = [k for k in keys if k.endswith("/index.json")]
+
+    shard_vector_items = []
+    global_offset = 0
+
+    # 2. index.json ごとに処理
+    for index_key in index_keys:
+        index_data = json.loads(
+            load_bytes_from_r2(s3, bucket_name, index_key)
+        )
+
+        current = index_data["current_revision"]
+        vector_bin_key = current["vector_bin"]
+
+        vecs = np.frombuffer(
+            load_bytes_from_r2(s3, bucket_name, vector_bin_key),
+            dtype=np.float32
+        ).reshape(-1, 512)
+
+        for v in index_data["vectors"]:
+            shard_vector_items.append({
+                "offset": global_offset,
+                "drawing_uid": index_data["drawing_uid"],
+                "role": v.get("role"),
+                "part_id": v.get("part_id"),
+                "page": v.get("page"),
+                "bbox": v.get("bbox"),
+                "image_key": v.get("image_key"),
+                "base_dir": current["base_dir"],
+                "vector": vecs[v["offset"]],
+            })
+            global_offset += 1
+
+    # 3. FAISS 再構築（全件）
+    build_faiss_index_from_vector_items(
+        vector_items=shard_vector_items,
+        shard_id="001",
+        s3=s3,
+        bucket_name=bucket_name,
+    )
+
+def list_keys_from_r2(s3, bucket_name: str, prefix: str) -> list[str]:
+    keys = []
+    token = None
+
+    while True:
+        kwargs = {
+            "Bucket": bucket_name,
+            "Prefix": prefix,
+        }
+        if token:
+            kwargs["ContinuationToken"] = token
+
+        resp = s3.list_objects_v2(**kwargs)
+
+        for obj in resp.get("Contents", []):
+            keys.append(obj["Key"])
+
+        if not resp.get("IsTruncated"):
+            break
+
+        token = resp.get("NextContinuationToken")
+
+    return keys
+
+def load_bytes_from_r2(s3, bucket_name: str, key: str) -> bytes:
+    obj = s3.get_object(Bucket=bucket_name, Key=key)
+    return obj["Body"].read()
 
 
 @dataclass 
@@ -799,18 +1043,22 @@ class IntelligentPDFAnalyzer:
             index_key = f"index/shards/{shard_id}/faiss.index"
             mapping_key = f"index/shards/{shard_id}/mapping.json"
 
-            print(index_key, mapping_key)
-            # faiss.index（R2 → 一時ファイル）
-            obj = self._load_data_from_r2(index_key)
-            logger.info(f"Faiss index size: {len(obj)} bytes")
+            index_bytes = self._load_data_from_r2(index_key)
+            logger.info(f"Faiss index size: {len(index_bytes)} bytes")
 
-            with tempfile.NamedTemporaryFile(delete=False) as f:
-                f.write(obj)
-                self.faiss_index = faiss.read_index(f.name)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = os.path.join(tmpdir, "faiss.index")
+                with open(path, "wb") as f:
+                    f.write(index_bytes)
+                    f.flush()
+                    os.fsync(f.fileno())   # ★ ローカルでも必須
 
-            # mapping.json（R2 → memory）
-            obj = self._load_data_from_r2(mapping_key)
-            self.vector_mapping = json.loads(obj.decode("utf-8"))
+                # ★ 必ず close 後に読む
+                self.faiss_index = faiss.read_index(path)
+
+            # --- mapping.json ---
+            mapping_bytes = self._load_data_from_r2(mapping_key)
+            self.vector_mapping = json.loads(mapping_bytes.decode("utf-8"))
 
     def list_r2_keys(self, prefix: str) -> list[str]:
         keys = []
@@ -853,27 +1101,28 @@ class IntelligentPDFAnalyzer:
 
 
 
-    def save_ocr(self, pdf_bytes: bytes, parts_data: List, total_pages: int, batch_id: str) -> dict[str, str]:
+    def save_ocr(self, pdf_bytes: bytes, img_bytes: bytes, parts_data: List, total_pages: int, batch_id: str) -> dict[str, str]:
         print("OCR保存処理開始")
+
         start_time = time.time()
         ts = int(time.time()*1000)
         total_time = start_time
-        rawimg, pdf_sha256 = pdf_bytes_to_raw_image(pdf_bytes)
+        #rawimg, pdf_sha256, angle = pdf_bytes_to_raw_image(pdf_bytes)
+        pdf_sha256 = pdf_bytes_to_sha(img_bytes)
         drawing_uid = decide_drawing_uid(pdf_sha256)
-
-        ok, jpeg = cv2.imencode(".jpg", rawimg, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-        if not ok:
-            raise RuntimeError("JPEG encode failed")
+        rawimg = img_bytes
+        #ok, jpeg = cv2.imencode(".jpg", rawimg, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        #if not ok:
+        #    raise RuntimeError("JPEG encode failed")
 
         try:
-            result = run_gemi(jpeg.tobytes())
+            result = run_gemi(rawimg)
             ocr_result, gemiPrice = result if result else ({}, 0)
         except Exception as e:
             logger.error(f"❌ gemi-OCRエラー: {e}")
             raise
         
         print(f"🧾 OCR:費用{gemiPrice:.3f}円, {ocr_result},秒数: {time.time() - start_time:.2f}s, トータル時間: {time.time() - total_time:.2f}s")
-
         start_time = time.time()
         if ocr_result.get("drawing_number"):
             drawing_number = str(ocr_result.get("drawing_number"))
@@ -885,6 +1134,7 @@ class IntelligentPDFAnalyzer:
             "processing_info": ocr_result.get("processing_info", []),
         }
 
+        logger.info(f"drawing_uid: {drawing_uid}, drawing_number: {drawing_number}")
         base_dir = f"drawings/{drawing_uid}/revisions/{ts}"
         parts = []
         parts_json = []
@@ -893,12 +1143,12 @@ class IntelligentPDFAnalyzer:
             bbox = part["bbox"]  # (x, y, w, h)
 
             part_id = make_part_id(base_dir, page, bbox)
-            p_key = f"{base_dir}/parts/{part_id}.png"
+            p_key = f"{base_dir}/parts/{part_id}.jpg"
 
             # Encode part image to PNG bytes
             part_bytes = part.get("bytes")
             if part_bytes is not None:
-                if self.upload_bytes_to_r2(part_bytes, p_key, "image/png"):
+                if self.upload_bytes_to_r2(part_bytes, p_key, "image/jpeg"):
                     parts.append({
                         "part_id": part_id,
                         "page": page,
@@ -913,52 +1163,34 @@ class IntelligentPDFAnalyzer:
         save_revision_tags(revision_id, ocr_result)
         print(f"💾 DB保存完了, 秒数: {time.time() - start_time:.2f}s, トータル時間: {time.time() - total_time:.2f}s")
         start_time = time.time()
-        ROTATE ={"correct": 0, "left_tilted": 90, "upside_down": 180, "right_tilted": 270}
-        angle = ROTATE.get(ocr_result.get('orientation', "correct"), 0)
-
-        # PDFと画像を保存するための変数
-        final_pdf_bytes = rotate_pdf_bytes(pdf_bytes, angle)
-        final_img_bytes = None
-
-        if angle != 0:
-            final_img_bytes = make_fullpage_jpeg_from_pdf(final_pdf_bytes, ts)
-        else:
-            final_img_bytes = make_fullpage_jpeg_from_img(rawimg)
 
 
-        pdf_key = f"{base_dir}/ocr.pdf"
-        logger.info(f"💾 R2アップロード開始: {pdf_key}")
-        self.upload_bytes_to_r2(final_pdf_bytes, pdf_key, "application/pdf")
+
+        logger.info(f"💾 R2アップロード開始")
 
         rawpdf_key = f"{base_dir}/raw.pdf"
         self.upload_bytes_to_r2(pdf_bytes, rawpdf_key, "application/pdf")
 
-        rawjpg_key = f"{base_dir}/raw.jpg"
-        self.upload_bytes_to_r2(jpeg.tobytes(), rawjpg_key, "image/jpeg")
-
         jpg_key = f"{base_dir}/fullpage.jpg"
         self.upload_bytes_to_r2(
-            final_img_bytes,
+            rawimg,
             jpg_key,
             "image/jpeg"
         )
 
+        logger.info(f"💾 r2図面保存完了: {base_dir},秒数: {time.time() - start_time:.2f}s, トータル時間: {time.time() - total_time:.2f}s")
 
-        logger.info(f"💾 r2図面保存完了: {pdf_key},秒数: {time.time() - start_time:.2f}s, トータル時間: {time.time() - total_time:.2f}s")
         start_time = time.time()
-        
-        logger.info(f"🚀 最後の1件、バッチCLIP処理開始、全{total_pages}件、バッチID: {batch_id}")
-
         base_keys = check_batch(batch_id, base_dir, total_pages, parts_json)
-        logger.info(f"バッチCLIP対象件数: {(base_keys)}")
+        #base_keys = check_batcha("50194477")
         if not base_keys:
+            logger.info(f"CLIP対象貯蓄中")
             return {"base_dir": base_dir, "status": "ok"}
-        
-        batch_clear(batch_id)
-
-        logger.info(f"🚀 最後の1件、バッチCLIP処理開始、全{total_pages}件、バッチID: {batch_id}")
         self.save_clip(base_keys=base_keys["revs"], all_parts_bytes=base_keys["all_bytes"])
-        logger.info(f"🚀 バッチCLIP処理完了、全{len(base_keys)}件、秒数: {time.time() - start_time:.2f}s, トータル時間: {time.time() - total_time:.2f}s")
+        if base_keys["is_last_batch"]:
+            logger.info(f"🚀 最後の1件、バッチCLIP処理開始、全{total_pages}件、バッチID: {batch_id}")
+            batch_clear(batch_id)
+        #logger.info(f"🚀 バッチCLIP処理完了、全{len(base_keys)}件、秒数: {time.time() - start_time:.2f}s, トータル時間: {time.time() - total_time:.2f}s")
         return {"base_dir": base_dir, "status": "ok"}
     
 
@@ -1009,7 +1241,7 @@ class IntelligentPDFAnalyzer:
         /batch_analyze エンドポイント用: 
         R2上の複数の図面データに対し、CLIPベクトル化をまとめて実行する
         """
-        logger.info(f"🚀 Batch analysis started for {base_keys}")
+        logger.info(f"🚀 Batch analysis started")
 
         all_images_to_send = []
         all_revisions = []
@@ -1027,29 +1259,15 @@ class IntelligentPDFAnalyzer:
                 #meta_bytes = self._load_data_from_r2(meta_key)
                 #if not meta_bytes: continue
                 
-                #metadata = json.loads(meta_bytes.decode('utf-8'))
-                all_revisions.append(rec)
-                
-                logger.info(f"✅ supadata読み込み完了{parts}")
+                #metadata = json.loads(meta_bytes.decode('utf-8'))                
+                logger.info(f"✅ supadata読み込み完了")
                 #return
                 # B. PDFを読み込み、CLIP用のメイン画像PNGをメモリで生成
-                pdf_bytes = self._load_data_from_r2(pdf_url)
-                if not pdf_bytes: continue
-
-                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                page = doc[0]
-                pix = page.get_pixmap(dpi=150)
-
-                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                img.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
-
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                main_img_bytes = buf.getvalue()
-                doc.close()
+                img_bytes = self._load_data_from_r2(base_key + "/fullpage.jpg")
+                if not img_bytes: continue
                 all_images_to_send.append({
                     "id": f"{base_key}:main",
-                    "image": base64.b64encode(main_img_bytes).decode("utf-8")
+                    "image": base64.b64encode(img_bytes).decode("utf-8")
                 })
                 # C. パーツ画像を読み込む
                 for part in parts:
@@ -1099,6 +1317,41 @@ class IntelligentPDFAnalyzer:
             bin_key = f"{base_key}/vector.bin"
             self.upload_bytes_to_r2(bin_bytes, bin_key, "application/octet-stream")
 
+
+            index = {
+                "drawing_uid": vision["drawing_uid"],
+                "current_revision": {
+                    "base_dir": vision["base_dir"],
+                    "vector_bin": f'{vision["base_dir"]}/vector.bin'
+                },
+                "vectors": []
+            }
+
+            # main
+            index["vectors"].append({
+                "offset": 0,
+                "role": "main",
+                "image_key": "fullpage.png"
+            })
+
+            # parts
+            for i, part in enumerate(vision.get("parts", []), start=1):
+                index["vectors"].append({
+                    "offset": i,
+                    "role": "part",
+                    "part_id": part["part_id"],
+                    "page": part["page"],
+                    "bbox": part["bbox"],
+                    "image_key": part["image_key"]
+                })
+
+            index_key = f'drawings/{vision["drawing_uid"]}/index.json'
+            self.upload_bytes_to_r2(
+                json.dumps(index, ensure_ascii=False, indent=2).encode("utf-8"),
+                index_key,
+                "application/json"
+            )
+
             # --- ★ vector_items 組み立て（drawing単位） ---
             vector_items = assemble_vector_items(
                 vectors=[
@@ -1127,12 +1380,6 @@ class IntelligentPDFAnalyzer:
 
         if not shard_vector_items:
             raise RuntimeError("No vectors collected for shard")
-
-        build_faiss_index_from_vector_items(
-            vector_items=shard_vector_items,
-            shard_id="001",
-            upload_func=self.upload_bytes_to_r2,
-        )
 
         logger.info("🎉 Batch analysis complete.")
         logger.info(f"Total time: {time.time() - start_time:.2f}s")
@@ -1233,173 +1480,3 @@ class IntelligentPDFAnalyzer:
             logger.error("❌ RunPod Error", exc_info=True)
             return {}
         
-
-
-    def quick_ocr_analysis(self, tmp_pdf_path: str, upload_folder: Path, images: dict):
-        """⚡ 高速OCR解析（図番検出特化）+ PNG変換"""
-        
-        logger.info(f"⚡ 高速OCR解析開始: {tmp_pdf_path}")
-        start_time = time.time()
-
-        pdf_document = fitz.open(tmp_pdf_path)
-        page = pdf_document[0]  # 最初のページのみ解析
-        # upload_folder = uploads/<PDF名>_<i>
-        
-        quick_result = {}
-
-        upload_folder.mkdir(parents=True, exist_ok=True)
-        # 各ページを高速OCR解析 + PNG変換
-        logger.info(f"⚡ 高速解析中...")
-        
-        gptresult = gptocr(tmp_pdf_path)
-        quick_result = sanitize(gptresult)
-
-        # ================================
-        # PDF → PNG 変換
-        # ================================
-        # ========== 画像添付保存 ==========
-        parts_dir = upload_folder / "parts"
-        parts_dir.mkdir(exist_ok=True)
-        images_for_page = images.get(1, [])
-        parts_ready = []
-        for img in images_for_page:
-            new_path = parts_dir/ img["filename"]
-            with open(new_path, "wb") as f:
-                f.write(img["bytes"])
-            part_img = cv2.imread(str(new_path))
-            if part_img is None:
-                logger.warning(f"⚠️ 切り抜き画像読み込み失敗: {new_path}")
-                continue
-
-            part_img = crop_to_content(part_img)
-            parts_ready.append(part_img)
-
-                # VectorDB に保存
-                
-                #save_vector_record(
-                #    pdf_name=f"{base_stem}_part",
-                #    page_index=1,
-                #    vector=part_vec,
-                #    page_path=str(upload_folder)
-                #)
-                
-
-        matrix = fitz.Matrix(2.0, 2.0)
-        pix = page.get_pixmap(matrix=matrix, alpha=False, annots=True)
-
-        fullpage_path = upload_folder / f"fullpage.png"
-        pix.save(str(fullpage_path))
-        logger.info(f"🖼 PNG生成: {fullpage_path}")
-        image_filename = fullpage_path.name
-        logger.info(f"🖼 画像ファイル名: {image_filename}")
-        # ================================
-        # 正位置回転 + 余白除去 + リサイズ
-        # ================================
-        img = cv2.imread(str(fullpage_path))
-        img, rotation_deg = auto_rotate_image_90deg(img)
-        img = crop_to_content(img)
-
-        cv2.imwrite(str(fullpage_path), img)
-        logger.info(f"🧭 正位補正完了: rotation={rotation_deg}°")
-
-        # ================================
-        # RunPod Serverless へ送信
-        # ================================
-        logger.info("🚀 RunPod GPUへベクトル化リクエスト送信中...")
-        
-        # 1. 画像データをリスト化 (fullpage + parts)
-        #    OpenCVの画像(numpy array)をBase64文字列に変換します
-        images_to_send = [img] + parts_ready
-        b64_images = []
-
-        for cv_img in images_to_send:
-            ok, buf = cv2.imencode(".png", cv_img)
-            if ok:
-                b64_str = base64.b64encode(buf).decode("utf-8")
-                b64_images.append(b64_str)
-            else:
-                logger.error("❌ 画像のエンコードに失敗しました")
-
-        if not RUNPOD_API_KEY:
-            logger.error("❌ RunPod API Keyが見つかりません。環境変数を設定してください。")
-            full_vec, part_vecs = [], []
-        else:
-            # 2. RunPod API リクエスト作成
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {RUNPOD_API_KEY}"
-            }
-            payload = {
-                "input": {
-                    "images": b64_images
-                }
-            }
-            try:
-                # runsyncで同期実行 (タイムアウトは長めに設定: Cold Start 15~30秒 + 処理時間)
-                rp_response = requests.post(str(RUNPOD_URL), json=payload, headers=headers, timeout=120)
-                rp_response.raise_for_status()
-                rp_data = rp_response.json()
-
-                if rp_data.get("status") == "COMPLETED":
-                    # 成功: ベクトルリストを取得
-                    res = rp_data["output"]["vectors"]
-                else:
-                    logger.error(f"❌ RunPod Execution Failed: {rp_data}")
-                    res = [] # エラー時は空リスト等でハンドリング
-                    
-            except Exception as e:
-                logger.error(f"❌ RunPod Connection Error: {e}")
-                res = []
-
-            # ================================
-            # 結果の保存 (元のロジックを維持)
-            # ================================
-            if res and len(res) > 0:
-                full_vec = res[0]
-                part_vecs = res[1:]
-            else:
-                full_vec = []
-                part_vecs = []
-
-        logger.info("⚡ quick OCR保存完了 → quick_ocr.json")
-        ai_feature_path = upload_folder / "ai_features.json"
-
-        data = {
-            "clip_vector": full_vec,
-            "part_vector": part_vecs,
-            "folder_name": str(upload_folder)
-        }
-
-        with open(ai_feature_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-        logger.info("🤖 AI特徴抽出完了 → ai_features.json 保存")
-        logger.info("🤖 parts特徴抽出完了 → vectore_db 保存")
-        
-
-        # quick_ocr.json 形式で保存
-
-        quick_json = {
-            "page": 1,
-            "drawing_number": quick_result.get("drawing_number"),
-            "part_name": quick_result.get("part_name"),
-            "material": quick_result.get("material"),
-            "surface_treatment": quick_result.get("surface_treatment"),
-            "customer": quick_result.get("customer"),
-            "shape_type": quick_result.get("shape_type"),
-            "material_size": quick_result.get("material_size"),
-            "dimensions": quick_result.get("dimensions"),
-            "free_text": quick_result.get("freehand_notes"),
-            "image_path": str(fullpage_path)
-        }
-
-        logger.info(f"⚡ 高速OCR解析完了秒")            
-
-        logger.info(f"🖼️ PNG変換完了: → {upload_folder}")
-            
-        quick_path = upload_folder / "quick_ocr.json"
-        with open(quick_path, "w", encoding="utf-8") as f:
-            json.dump(quick_json, f, ensure_ascii=False, indent=2)
-
-        pdf_document.close()
-        return quick_json 

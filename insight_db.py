@@ -127,41 +127,118 @@ def check_batch(batch_id: str, base_dir: str, total_pages: int, parts_bytes_json
             "batch_id": batch_id,
             "base_dir": base_dir,
             "parts_bytes": parts_bytes_json,
+            "status": "pending"
         },
         on_conflict="base_dir",
     ).execute()
 
-    resp = (
+    total_count = (
         supabase
         .table("drawing_batch_items")
-        .select("base_dir", "parts_bytes")
+        .select("base_dir", count="exact")
         .eq("batch_id", batch_id)
         .execute()
+        .count
+    )
+    pending_count = (
+        supabase
+        .table("drawing_batch_items")
+        .select("base_dir", count="exact")
+        .eq("batch_id", batch_id)
+        .eq("status", "pending")
+        .execute()
+        .count
     )
 
-    if len(resp.data) != total_pages:
+    send_limit = None
+    is_last_batch = False
+
+    if pending_count >= 10:
+        send_limit = 10
+    elif total_count == total_pages and pending_count > 0:
+        send_limit = pending_count
+        is_last_batch = True
+    else:
+        return None
+    resp = supabase.rpc(
+        "pick_clip_batch",
+        {
+            "p_batch_id": batch_id,
+            "p_limit": send_limit,
+        }
+    ).execute()
+
+    rows = resp.data
+    if not rows:
         return None
     
-    base_dirs = [r["base_dir"] for r in resp.data]
+    base_dirs = [r["base_dir"] for r in rows]
+    
     revs = (
-        supabase.table("drawing_revisions")
+        supabase
+        .table("drawing_revisions")
         .select("revision_id, drawing_uid, base_dir, pdf_url, parts")
         .in_("base_dir", base_dirs)
         .execute()
-    )
+    ).data
 
     all_bytes_map = {}
     
-    for row in resp.data:
+    for row in rows:
         p_list = row["parts_bytes"] # List
         for p in p_list:
             # { "part_id": "b64..." } -> { "part_id": bytes } に戻して保持
             all_bytes_map[p["part_id"]] = base64.b64decode(p["b64_image"])
 
     return {
-        "revs": revs.data,
-        "all_bytes": all_bytes_map
+        "revs": revs,
+        "all_bytes": all_bytes_map,
+        "is_last_batch": is_last_batch
     }
+
+
+
+def check_batcha(batch_id: str):
+
+    pending_count = 8
+    limit = min(10, pending_count)
+
+    resp = supabase.rpc(
+        "pick_clip_batch",
+        {
+            "p_batch_id": batch_id,
+            "p_limit": limit,
+        }
+    ).execute()
+
+    rows = resp.data
+    if not rows:
+        return None
+    
+    base_dirs = [r["base_dir"] for r in rows]
+    
+    revs = (
+        supabase
+        .table("drawing_revisions")
+        .select("revision_id, drawing_uid, base_dir, pdf_url, parts")
+        .in_("base_dir", base_dirs)
+        .execute()
+    ).data
+
+    all_bytes_map = {}
+    
+    for row in rows:
+        p_list = row["parts_bytes"] # List
+        for p in p_list:
+            # { "part_id": "b64..." } -> { "part_id": bytes } に戻して保持
+            all_bytes_map[p["part_id"]] = base64.b64decode(p["b64_image"])
+
+    return {
+        "revs": revs,
+        "all_bytes": all_bytes_map,
+        "is_last_batch": pending_count <= limit
+    }
+
 
 
 def extract_search_fields(tags: dict) -> dict:

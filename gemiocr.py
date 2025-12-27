@@ -22,49 +22,7 @@ def run_gemi(jpeg_bytes):
 "dimensions":["主要寸法,数値のみ,大中小いれて10個程度"],
 "processing_info":["ネジ/穴(重複なし。例:M6,2-φ10)","はめあい公差(例:H7)※数値公差/粗さ/JIS規格名除外", 最大20個],
 "free_hand_text": "",
-"orientation": title_block_position,
 }
-[title_block_position Judgment Rules]
-Identify the physical location of the Title Block
-(the table that contains BOTH:
-- Company Name
-- Drawing Number
-- Scale
-AND is typically located near the drawing border)
-
-Assume the image coordinate system:
-- Origin is at the TOP-LEFT of the image.
-- X increases to the RIGHT.
-- Y increases DOWNWARD.
-
-Determine which CORNER of the image contains the Title Block.
-
-Output exactly one of the following values:
-
-- "correct"
-  → Title Block is located at the BOTTOM-RIGHT corner.
-
-- "upside_down"
-  → Title Block is located at the TOP-LEFT corner.
-
-- "right_tilted"
-  → Title Block is located at the BOTTOM-LEFT corner.
-
-- "left_tilted"
-  → Title Block is located at the TOP-RIGHT corner.
-
-Strict rules:
-- Judge by the physical position of the table, not by text orientation.
-- Do NOT infer rotation by readability of text.
-- If uncertain, choose the closest corner.
-- Output ONLY the label string.
-- The Title Block is always attached to or very close to the drawing border.
-- Tables floating inside the drawing area are NOT Title Blocks.
-- Company Name may appear as a logo or abbreviated company text.
-- Drawing Number may appear as "DWG No.", "Drawing No.", or similar.
-- Scale may appear as "SCALE" or a numeric ratio.
-- If multiple tables satisfy the conditions, choose the one closest to the image border.
-
 [注意事項]
 -material_sizeに関してはthickness_min:部材の「板厚」(図面内最小値),width_max:部材の「幅」(図面内最大値).
 -outer_max重要指示:部材の「切断長」(図面内最大値).形鋼は断面でなく長さを記載.

@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 import logging
 import base64
 
+from sympy import im
+print("🚀 insight.py ロード開始")
 supabase = None
 _clip_model = None
 _clip_preprocess = None
@@ -71,11 +73,17 @@ output_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/output", StaticFiles(directory="output"), name="output")
 
 @app.post("/warmup")
-async def warmup():
+async def warmup(purpose: str = "common"):
     print("🧠 モデルウォームアップ")
     global intelligent_analyzer, supabase
     from supabase import create_client
     try:
+        if os.getenv("K_SERVICE") is None:
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(".env")
+            except Exception:
+                pass
         if intelligent_analyzer is None:
             import importlib
             module = importlib.import_module("intelligent_pdf_analyzer")
@@ -84,11 +92,21 @@ async def warmup():
             #from intelligent_pdf_analyzer import IntelligentPDFAnalyzer
             intelligent_analyzer = IntelligentPDFAnalyzer()
 
-        get_cpu_clip()
-        intelligent_analyzer.load_faiss_shard("001")
-        import faiss
-        import faiss.contrib.torch_utils
-        logger.info("faiss imported successfully")
+        if purpose == "search":
+            import faiss
+            import faiss.contrib.torch_utils
+
+            print("🧠 Loading CPU CLIP model...")
+            get_cpu_clip()
+
+            print("🧠 Rebuilding FAISS...")
+            from intelligent_pdf_analyzer import rebuild_faiss
+            rebuild_faiss()
+
+            intelligent_analyzer.load_faiss_shard("001")
+            print("🧠 Search engine ready")
+
+        logger.info("database load....")
         SUPABASE_URL = os.getenv("SUPABASE_URL")
         SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -290,40 +308,67 @@ from tempfile import NamedTemporaryFile
 async def split_pdf(pdf: UploadFile = File(...)):
     #高速メモリ展開
     import fitz
-
+    import numpy as np
+    import cv2
+    from intelligent_pdf_analyzer import auto_rotate_image
     try:
         contents = await pdf.read()
         # メモリからPDFを開く
         doc = fitz.open(stream=contents, filetype="pdf")
-        
+        TARGET = 1024
+        SCALE = 2.0
+        DPI = 150 
         pages_info = []
 
         for i in range(len(doc)):
-            # --- A. 本物の単一ページPDFを作成 (base64用) ---
-            single_doc = fitz.open()                 # 空のPDF作成
-            single_doc.insert_pdf(doc, from_page=i, to_page=i) # ページをコピー
-            pdf_bytes = single_doc.tobytes()         # バイナリ化
-            single_doc.close()                       # メモリ解放
-            
-            b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
-
-            # --- B. プレビュー用画像を作成 (images用) ---
-            # ※フロントでサムネ表示を高速化したい場合に使用
             page = doc[i]
-            pix = page.get_pixmap(dpi=150)           # 解像度は適宜調整
-            img_bytes = pix.tobytes("png")
-            b64_img = base64.b64encode(img_bytes).decode("utf-8")
 
+            # --- A. ページを1024基準で描画（ラスタライズ） ---
+            zoom = (TARGET / page.rect.width) * SCALE
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, dpi=DPI, alpha=False)
+
+            img = np.frombuffer(
+                pix.samples,
+                dtype=np.uint8
+            ).reshape(pix.h, pix.w, pix.n)
+
+            if pix.n == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+            elif pix.n == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+            # ② ここで角度取得（※回転しないのが推奨）
+            #angle = detect_angle(img)          # ← 推奨
+            img, angle = auto_rotate_image(img)
+            img_bytes = cv2.imencode(
+                ".jpg",
+                img,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+            )[1].tobytes()
+
+            h, w = img.shape[:2]
+            
+            # --- B. 画像PDFとして1ページPDFを再生成 ---
+            new_pdf = fitz.open()
+            rect = fitz.Rect(0, 0, w, h)
+            p = new_pdf.new_page(width=w, height=h)
+            p.insert_image(rect, stream=img_bytes)
+
+            pdf_bytes = new_pdf.tobytes(
+                garbage=4,
+                deflate=True,
+                clean=True
+            )
+            new_pdf.close()
+
+
+            b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
+            b64_img = base64.b64encode(img_bytes).decode("utf-8")
             pages_info.append({
                 "page": i + 1,
-                # ▼ ここが修正点: 中身もヘッダーもPDFにする
                 "base64": f"data:application/pdf;base64,{b64_pdf}",
-                
-                # ▼ 画像は画像として返す (フロントで使い分ける用)
-                "images": f"data:image/png;base64,{b64_img}",
-                
-                "width": page.rect.width,
-                "height": page.rect.height
+                "img": f"data:image/jpeg;base64,{b64_img}",
             })
         
         doc.close()
@@ -336,10 +381,9 @@ async def split_pdf(pdf: UploadFile = File(...)):
 
 
 @app.post("/save")
-async def save_files(pdf: List[UploadFile] = File(...), images: Optional[List[UploadFile]] = File(None), totalSets: int = Form(1), batchId: str = Form(...)):
+async def save_files(pdf: List[UploadFile] = File(...), img64:List[UploadFile] = File(...), images: Optional[List[UploadFile]] = File(None), totalSets: int = Form(1), batchId: str = Form(...)):
     print ("🚀 /保存添付ID:", batchId)
     import re
-
     try:
         # 1. データのメモリ読み込み (非同期処理)
         if not pdf:
@@ -348,6 +392,7 @@ async def save_files(pdf: List[UploadFile] = File(...), images: Optional[List[Up
         # フロントが1枚ずつ送ってくるので、先頭の1枚を取得
         target_pdf = pdf[0]
         pdf_bytes = await target_pdf.read()
+        img_bytes = await img64[0].read()
         page_match = re.search(r"page_(\d+)", target_pdf.filename)
         current_page = int(page_match.group(1)) if page_match else 1
         # 画像パーツがあれば、それもメモリに吸い出す
@@ -369,6 +414,7 @@ async def save_files(pdf: List[UploadFile] = File(...), images: Optional[List[Up
         result = await asyncio.to_thread(
             intelligent_analyzer.save_ocr,
             pdf_bytes=pdf_bytes,
+            img_bytes=img_bytes,
             parts_data=parts_data,
             total_pages=totalSets,
             batch_id=batchId
@@ -380,7 +426,7 @@ async def save_files(pdf: List[UploadFile] = File(...), images: Optional[List[Up
     except Exception as e:
         logger.error(f"❌ OCR,labeling Error: {e}", exc_info=True)
 
-def faiss_search(query_vec_torch, top_k=10):
+def faiss_search(query_vec_torch, top_k=100):
     import faiss
     import faiss.contrib.torch_utils  # torch Tensor 対応を有効化
     from insight_db import get_data
@@ -398,25 +444,45 @@ def faiss_search(query_vec_torch, top_k=10):
         )
 
     faiss_index = intelligent_analyzer.faiss_index
-    items = intelligent_analyzer.vector_mapping["items"]
+    items = intelligent_analyzer.vector_mapping
 
     # query_vec_torch: torch.Tensor [1, dim], float32, 正規化済み
     scores, ids = faiss_index.search(query_vec_torch, top_k)
-    print(f"FAISS search scores: {scores}, ids: {ids}")
-    results = []
-    item_count = len(items)
+    #print(f"FAISS search scores: {scores}, ids: {ids}")
 
-    for score, idx in zip(scores[0].tolist(), ids[0].tolist()):
-        if idx < 0 or idx >= item_count:
+    best_by_drawing = {}
+
+    for score, idx in zip(scores[0], ids[0]):
+        if idx < 0 or idx >= len(items):
             continue
 
-        meta = items[idx]  # ← vector_id 前提で直接 index 参照
+        meta = items[idx]
+        uid = meta["drawing_uid"]
+
+        adj_score = float(score)
+        if meta["role"] == "main":
+            adj_score += 0.01  # optional
+
+        prev = best_by_drawing.get(uid)
+        if (prev is None) or (adj_score > prev["score"]):
+            best_by_drawing[uid] = {
+                "score": adj_score,
+                "best_idx": int(idx),      # どの vector が代表になったか（デバッグ用）
+                "best_role": meta["role"], # 同上
+            }
+
+    results = []
+    for uid, info in best_by_drawing.items():
+        full_data = get_data(uid)
+        if not full_data or not isinstance(full_data, dict):
+            continue
+
         results.append({
-            "score": float(score),
-            "drawing_uid": meta["drawing_uid"],
-            "role": meta["role"],
-            "full_data": get_data(meta["drawing_uid"]),
-            "base_dir": meta["base_dir"],
+            "score": info["score"],
+            "drawing_uid": uid,
+            "role": "main",
+            "base_dir": full_data.get("base_dir"),
+            "full_data": full_data,
         })
     return {
         "results": results
@@ -425,56 +491,51 @@ def faiss_search(query_vec_torch, top_k=10):
 
 def faiss_search_single(query_vec_torch, top_k=10):
     import faiss
-    import faiss.contrib.torch_utils  # torch Tensor 対応を有効化
+    import faiss.contrib.torch_utils
     from insight_db import get_data
 
     if intelligent_analyzer is None:
-        raise HTTPException(
-            status_code=503,
-            detail="System not warmed up. Call /warmup first."
-        )
-
-    if not hasattr(intelligent_analyzer, "faiss_index"):
-        raise HTTPException(
-            status_code=503,
-            detail="FAISS index not loaded."
-        )
+        raise HTTPException(503, "System not warmed up")
 
     faiss_index = intelligent_analyzer.faiss_index
-    items = intelligent_analyzer.vector_mapping["items"]
+    items = intelligent_analyzer.vector_mapping
 
-    # query_vec_torch: torch.Tensor [1, dim], float32, 正規化済み
     scores, ids = faiss_index.search(query_vec_torch, top_k)
-    print(f"FAISS search scores: {scores}, ids: {ids}")
+
+    # --- 1. drawing_uid 単位でスコア集約 ---
+    best_by_drawing = {}
+    for score, idx in zip(scores[0], ids[0]):
+        if idx < 0 or idx >= len(items):
+            continue
+
+        uid = items[idx]["drawing_uid"]
+        if uid not in best_by_drawing or score > best_by_drawing[uid]["score"]:
+            best_by_drawing[uid] = {"score": float(score)}
+
+    # --- 2. main meta を引く ---
+    main_meta_by_uid = {
+        item["drawing_uid"]: item
+        for item in items
+        if item["role"] == "main"
+    }
+
+    # --- 3. main だけ返す ---
     results = []
-    item_count = len(items)
-    seen_uids = set()
-    for score, idx in zip(scores[0].tolist(), ids[0].tolist()):
-        if idx < 0 or idx >= item_count:
+    for uid, info in best_by_drawing.items():
+        main_meta = main_meta_by_uid.get(uid)
+        if not main_meta:
             continue
-
-        meta = items[idx]
-        uid = meta["drawing_uid"]
-        if uid in seen_uids:
-            continue
-
         full_data = get_data(uid)
         if not full_data or not isinstance(full_data, dict):
             continue
-        current_base_dir = full_data.get("base_dir")
-        
         results.append({
-            "score": float(score),
+            "score": info["score"],
             "drawing_uid": uid,
-            "role": meta["role"],
+            "base_dir": main_meta["base_dir"],
             "full_data": full_data,
-            "base_dir": current_base_dir, # 常に現行のパスを使用
         })
-        seen_uids.add(uid)
-    return {
-        "results": results
-    }
 
+    return {"results": results}
 
 def build_final_results(top_results):
     final_results = []
@@ -503,7 +564,7 @@ def build_final_results(top_results):
                 "updated_at": item["full_data"]["updated_at"],
             },
 
-            "pdf": build_public_url(f"{base_dir}/ocr.pdf"),
+            "pdf": build_public_url(f"{base_dir}/raw.pdf"),
             "img": [{
                 "imgFile": build_public_url(f"{base_dir}/fullpage.jpg"),
                 "similarity": sim,
@@ -533,6 +594,7 @@ def build_final_results(top_results):
 async def search_similar_images(
     images: Optional[List[UploadFile]] = File(None),
     pdf: Optional[UploadFile] = File(None),
+    img64: Optional[UploadFile] = File(None),
     searchMode: Optional[str] = Form('manual'),
     hybridMode: Optional[str] = Form('false')
 ) -> SearchResponse:
@@ -540,11 +602,14 @@ async def search_similar_images(
         logger.info(f"🔍 検索リクエスト受信: searchMode={searchMode}, hybridMode={hybridMode}")
         logger.info(f"📁 PDF: {pdf.filename if pdf else 'なし'}")
         logger.info(f"🖼️ 画像: {len(images) if images else 0}件")
+        if img64:
+            img_bytes = await img64.read()
+            img_array = np.frombuffer(img_bytes, np.uint8)
+            rawimg = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
         # 🤖 全自動モード（PDF全体解析）
         if searchMode == 'auto_full' and pdf:
             logger.info("🚀 全自動モードで処理開始")
-            pdf_bytes = await pdf.read()
-            return await handle_auto_full_search(pdf_bytes, pdf.filename)
+            return await handle_auto_full_search(rawimg)
         
         # ✂️ 手動切り取りモード（従来機能）
         if images and len(images) > 0:
@@ -555,8 +620,12 @@ async def search_similar_images(
     except Exception as e:
         logger.error(f"❌ 検索エラー: {str(e)}")
         raise HTTPException(status_code=500, detail=f"検索処理でエラーが発生しました: {str(e)}")
-    
-async def handle_auto_full_search(pdf_bytes: bytes, filename: str) -> SearchResponse:
+
+import cv2
+import numpy as np
+
+
+async def handle_auto_full_search(rawimg) -> SearchResponse:
     """🤖 FAISS を使った全自動PDF検索（UI完全互換版）"""
     import torch
     from PIL import Image
@@ -565,15 +634,8 @@ async def handle_auto_full_search(pdf_bytes: bytes, filename: str) -> SearchResp
     model, preprocess = get_cpu_clip()
     import importlib
 
-    module = importlib.import_module("intelligent_pdf_analyzer")
-    pdf_bytes_to_raw_image = module.pdf_bytes_to_raw_image
     try:
-        logger.info(f"🚀 全自動PDF解析開始: {filename}")
-        # -----------------------
-        # 1. PDF → fullpage.png
-        # -----------------------
-        rawimg, _ = pdf_bytes_to_raw_image(pdf_bytes)
-
+        logger.info(f"🚀 全自動PDF解析開始")
         img_rgb = cv2.cvtColor(rawimg, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(img_rgb)
 
@@ -588,7 +650,7 @@ async def handle_auto_full_search(pdf_bytes: bytes, filename: str) -> SearchResp
         query_vec = vec.contiguous()
 
         top_results = faiss_search(query_vec, top_k=10)
-        logger.info(f"🎯 FAISS検索結果: {top_results} 件")
+        logger.info(f"🎯 FAISS検索結果: {len(top_results)} 件")
         return build_final_results(top_results)
 
 
@@ -668,12 +730,33 @@ def cosine_similarity(v1, v2):
 
 
 @app.get("/data_list")
-async def get_data_list(limit: int = 20, offset: int = 0):
+async def get_data_list(limit: int = 25, offset: int = 0):
+    from supabase import create_client
+    global supabase
+    if os.getenv("K_SERVICE") is None:
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(".env")
+            except Exception:
+                pass
     if supabase is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Supabase is not initialized. Call /warmup first."
-        )
+
+        SUPABASE_URL = os.getenv("SUPABASE_URL")
+        SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            logger.warning("SUPABASE env vars are not set. Supabase disabled.")
+            supabase = None
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "partial",
+                    "message": "Models loaded, Supabase disabled"
+                }
+            )
+
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
     resp = (
         supabase
         .table("drawings")
@@ -685,6 +768,7 @@ async def get_data_list(limit: int = 20, offset: int = 0):
                 drawing_number,
                 parts_name,
                 material,
+                surface,
                 thick,
                 width,
                 length,
@@ -692,6 +776,8 @@ async def get_data_list(limit: int = 20, offset: int = 0):
                 orientation_deg,
                 img_url,
                 pdf_url,
+                tags_json,
+                parts,
                 updated_at
             )
             """
@@ -725,6 +811,7 @@ async def get_data_list(limit: int = 20, offset: int = 0):
                 "drawing_number": rev.get("drawing_number"),
                 "parts_name": rev.get("parts_name"),
                 "material": rev.get("material"),
+                "surface": rev.get("surface"),
                 "thick": rev.get("thick"),
                 "width": rev.get("width"),
                 "length": rev.get("length"),
@@ -732,6 +819,8 @@ async def get_data_list(limit: int = 20, offset: int = 0):
                 "orientation_deg": rev.get("orientation_deg"),
                 "preview_url": build_public_url(rev["img_url"]),
                 "pdf_url": build_public_url(rev["pdf_url"]),
+                "tags_json": rev.get("tags_json"),
+                "parts": build_parts_public(rev.get("parts")),
                 "updated_at": rev.get("updated_at"),
             })
 
@@ -739,8 +828,39 @@ async def get_data_list(limit: int = 20, offset: int = 0):
         "items": items,
         "total": total,
     }
+def build_parts_public(parts):
+    """
+    parts: list[dict] | None
+    image_key を public URL に変換して返す
+    """
+    if not parts or not isinstance(parts, list):
+        return []
+
+    out = []
+    for p in parts:
+        image_key = p.get("image_key")
+        if not image_key:
+            continue
+
+        out.append({
+            "image_key": build_public_url(image_key),
+        })
+
+    return out
+
 def build_public_url(path: str) -> str:
     r2_bucket_url = os.getenv("R2_PUBLIC_URL")
     if not r2_bucket_url:
         raise HTTPException(503, "R2 is not configured")
     return f"{r2_bucket_url}/{path}"
+
+
+if __name__ == "__main__":
+    import uvicorn
+    from insight import app
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8000,
+        reload=False
+    )
