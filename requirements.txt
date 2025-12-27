@@ -23,9 +23,17 @@ pdf2image
 # AI & Vector Search
 torch --extra-index-url https://download.pytorch.org/whl/cpu
 torchvision --extra-index-url https://download.pytorch.org/whl/cpu
-open_clip_torch
+open-clip-torch          # ★ 正式名称へ修正
 faiss-cpu
+
+# OCR / Parsing Utilities
+regex                   # ★ 追加
+sympy                   # ★ 追加（true 定数などで使用）
 
 # Utilities
 pandas
 requests
+
+# （必要になったら後で追加）
+# storage3
+# realtime
