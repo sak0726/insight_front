@@ -20,7 +20,6 @@ realtime
 boto3
 pandas
 regex
-gemiocr
 google-genai
 python-dotenv
 requests
