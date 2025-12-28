@@ -1,39 +1,26 @@
-# Web Framework
 fastapi
-uvicorn[standard]
+uvicorn
 python-multipart
-httpx
 
-# Database & Storage
-supabase
-boto3
-python-dotenv
-postgrest
+open-clip-torch
+torch
 
-# Google AI SDK
-google-genai
-
-# Image & PDF Processing
-opencv-python-headless
-numpy
-Pillow
-pymupdf
+PyMuPDF
+opencv-python
+pillow
 pdf2image
 
-# AI & Vector Search
-torch --extra-index-url https://download.pytorch.org/whl/cpu
-torchvision --extra-index-url https://download.pytorch.org/whl/cpu
-open-clip-torch          # ★ 正式名称へ修正
 faiss-cpu
 
-# OCR / Parsing Utilities
-regex                   # ★ 追加
-sympy                   # ★ 追加（true 定数などで使用）
+supabase
+postgrest
+storage3
+realtime
 
-# Utilities
+boto3
 pandas
+regex
+gemiocr
+google-genai
+python-dotenv
 requests
-
-# （必要になったら後で追加）
-# storage3
-# realtime
