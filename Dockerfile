@@ -22,6 +22,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 # アプリケーションコードのコピー
 COPY . .
 
-# ディレクトリ作成
-RUN mkdir -p public/uploads public/compares output
 CMD ["uvicorn", "insight:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "debug"]
