@@ -1,29 +1,21 @@
-from tracemalloc import start
 import cv2
 import numpy as np
 import fitz  # PyMuPDF
 from typing import Dict, List, Any, Tuple, Optional
 from dataclasses import dataclass, field
-from enum import Enum
 import json
 import os
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from pathlib import Path
 import hashlib
 import re
 import logging
 import time
 from PIL import Image
-import pandas as pd
-from postgrest import ReturnMethod
-from regex import F
 from gemiocr import run_gemi
 import requests
 import base64
-import time
 import boto3
-import io
 from io import BytesIO
 from pdf2image import convert_from_bytes
 # 標準ロギング設定（プロダクション品質）
@@ -32,7 +24,7 @@ import unicodedata
 from botocore.exceptions import ClientError
 import faiss
 import tempfile
-from insight_db import save_ocr_revision, check_batch, save_revision_tags, batch_clear, check_batcha
+from insight_db import save_ocr_revision, check_batch, save_revision_tags, batch_clear, mark_batch_done, mark_batch_processing, mark_batch_failed
 
 from dotenv import load_dotenv  # ← 追加
 load_dotenv()
@@ -226,6 +218,75 @@ def auto_rotate_image(img: np.ndarray) -> tuple[np.ndarray, int]:
     #ok, buf = cv2.imencode(".jpg", out_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
     return out_img, best_angle
+
+
+def detect_display_orientation(img: np.ndarray) -> int:
+    """
+    投影プロファイル法で図面の表示用正位置角度を検出する。
+
+    auto_rotate_image とは独立して動作し、DB保存用の orientation_deg に使用する。
+    CLIPベクトル生成・FAISSインデックスには一切影響しない（表示専用）。
+
+    Returns:
+        int: 正位置にするために必要な回転角度 (0, 90, 180, 270)
+             0=そのまま正位置, 90=時計回り90°で正位置, ...
+    """
+    if img is None:
+        return 0
+
+    # 判定用縮小画像（512px, 高速化）
+    h, w = img.shape[:2]
+    scale = 512 / max(h, w)
+    if scale < 1.0:
+        small = cv2.resize(img, None, fx=scale, fy=scale)
+    else:
+        small = img
+
+    # グレースケール & 2値化（文字・線を白に）
+    if len(small.shape) == 3:
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = small
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    best_angle = 0
+    best_score = -1.0
+
+    for angle in [0, 90, 180, 270]:
+        if angle == 0:
+            r = binary
+        elif angle == 90:
+            r = cv2.rotate(binary, cv2.ROTATE_90_CLOCKWISE)
+        elif angle == 180:
+            r = cv2.rotate(binary, cv2.ROTATE_180)
+        else:  # 270
+            r = cv2.rotate(binary, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        h_r, w_r = r.shape
+
+        # =====================================================
+        # 評価1: 水平投影プロファイルの分散（メイン）
+        # テキスト行が水平なら行ごとのピクセル数に明確なピーク列が生まれ分散が高くなる
+        # =====================================================
+        row_sums = np.sum(r, axis=1).astype(np.float64)
+        profile_variance = np.var(row_sums)
+
+        # =====================================================
+        # 評価2: 下部密度（補助）
+        # 表題欄は正位置のとき下部に集中する
+        # =====================================================
+        bottom_density = float(np.sum(r[int(h_r * 0.65):, :]))
+        top_density    = float(np.sum(r[:int(h_r * 0.35), :]))
+        score_bottom   = bottom_density - top_density
+
+        score = profile_variance * 1.0 + score_bottom * 0.05
+
+        if score > best_score:
+            best_score = score
+            best_angle = angle
+
+    return best_angle
+
 
 def image_to_ocr_pdf(img: np.ndarray, jpeg_quality=85) -> bytes:
     import fitz
@@ -588,100 +649,6 @@ def xbuild_faiss_index_from_vector_items(
     shard_id: str,
     upload_func,
 ) -> None:
-    """
-    vector_items:
-      順序保証された vector 情報（main / part 混在）
-    shard_id:
-      001
-    """
-
-    if not vector_items:
-        raise ValueError("vector_items is empty")
-
-
-    # --------------------------------------------------
-    # 1. vectors を FAISS 用 ndarray に変換
-    # --------------------------------------------------
-    vectors = np.vstack(
-        [item["vector"] for item in vector_items]
-    ).astype("float32")
-
-    dim = vectors.shape[1]
-    if dim != 512:
-        raise ValueError(f"Invalid vector dim: {dim}")
-
-    # cosine 類似度のため必須
-    faiss.normalize_L2(vectors)
-
-    # --------------------------------------------------
-    # 2. FAISS index 構築
-    # --------------------------------------------------
-    index = faiss.IndexFlatIP(dim)
-    index.add(vectors)
-
-    # --------------------------------------------------
-    # 3. mapping.json 構築
-    # --------------------------------------------------
-    mapping_items = []
-
-    for vector_id, item in enumerate(vector_items):
-        entry = {
-            "vector_id": vector_id,
-            "drawing_uid": item["drawing_uid"],
-            "role": item["role"],
-            "base_dir": item["base_dir"],
-        }
-
-        if item["role"] == "part":
-            entry.update({
-                "part_id": item["part_id"],
-                "page": item["page"],
-                "bbox": item["bbox"],
-                "image_key": item["image_key"],
-            })
-
-        mapping_items.append(entry)
-
-    mapping = {
-        "version": 1,
-        "dim": dim,
-        "metric": "cosine",
-        "shard_id": shard_id,
-        "count": len(mapping_items),
-        "items": mapping_items,
-    }
-
-    # --------------------------------------------------
-    # 4. atomic write（壊れない）
-    # --------------------------------------------------
-    with tempfile.TemporaryDirectory() as tmp:
-        faiss_path = os.path.join(tmp, "faiss.index")
-        mapping_path = os.path.join(tmp, "mapping.json")
-
-        faiss.write_index(index, faiss_path)
-        with open(mapping_path, "w", encoding="utf-8") as f:
-            json.dump(mapping, f, ensure_ascii=False, indent=2)
-
-        with open(faiss_path, "rb") as f:
-            upload_func(
-                f.read(),
-                f"index/shards/{shard_id}/faiss.index",
-                "application/octet-stream"
-            )
-
-        with open(mapping_path, "rb") as f:
-            upload_func(
-                f.read(),
-                f"index/shards/{shard_id}/mapping.json",
-                "application/json"
-            )
-
-
-def xbuild_faiss_index_from_vector_items(
-    vector_items: list[dict],
-    shard_id: str,
-    upload_func,
-) -> None:
     if not vector_items:
         raise ValueError("vector_items is empty")
 
@@ -933,6 +900,47 @@ def connect_r2():
         aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"),
         region_name="auto",
     )
+
+
+DELTA_PREFIX = "index/shared/delta/"
+
+
+def delete_prefix_from_r2(s3, bucket_name: str, prefix: str) -> int:
+    keys = list_keys_from_r2(s3, bucket_name, prefix=prefix)
+    if not keys:
+        return 0
+
+    deleted = 0
+    chunk = 1000
+    for i in range(0, len(keys), chunk):
+        batch = keys[i:i + chunk]
+        s3.delete_objects(
+            Bucket=bucket_name,
+            Delete={"Objects": [{"Key": k} for k in batch]}
+        )
+        deleted += len(batch)
+    return deleted
+
+
+def build_delta_payload(vector_items: list[dict]) -> dict:
+    if not vector_items:
+        return {"version": 1, "dim": 512, "count": 0, "vectors_b64": "", "items": []}
+
+    vectors = np.vstack([item["vector"] for item in vector_items]).astype("float32")
+    faiss.normalize_L2(vectors)
+
+    items = []
+    for item in vector_items:
+        meta = {k: v for k, v in item.items() if k != "vector"}
+        items.append(meta)
+
+    return {
+        "version": 1,
+        "dim": vectors.shape[1],
+        "count": len(items),
+        "vectors_b64": base64.b64encode(vectors.tobytes()).decode("utf-8"),
+        "items": items,
+    }
 def rebuild_faiss():
     s3 = connect_r2()
     bucket_name = os.getenv("R2_BUCKET_NAME")
@@ -979,6 +987,8 @@ def rebuild_faiss():
         s3=s3,
         bucket_name=bucket_name,
     )
+    deleted = delete_prefix_from_r2(s3, bucket_name, DELTA_PREFIX)
+    logger.info(f"✅ Cleared delta files: {deleted}")
 
 def list_keys_from_r2(s3, bucket_name: str, prefix: str) -> list[str]:
     keys = []
@@ -1036,6 +1046,9 @@ class IntelligentPDFAnalyzer:
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
         )
+        self.faiss_delta_index = None
+        self.vector_mapping_delta = []
+        self.delta_keys = set()
 
     def load_faiss_shard(self, shard_id: str = "001"):
             import faiss, json, tempfile
@@ -1058,7 +1071,41 @@ class IntelligentPDFAnalyzer:
 
             # --- mapping.json ---
             mapping_bytes = self._load_data_from_r2(mapping_key)
-            self.vector_mapping = json.loads(mapping_bytes.decode("utf-8"))
+            mapping_data = json.loads(mapping_bytes.decode("utf-8"))
+            if isinstance(mapping_data, dict) and "items" in mapping_data:
+                self.vector_mapping = mapping_data["items"]
+            else:
+                self.vector_mapping = mapping_data
+
+    def refresh_delta_index(self):
+            import faiss, json
+
+            delta_keys = self.list_r2_keys(DELTA_PREFIX)
+            new_keys = [k for k in delta_keys if k not in self.delta_keys]
+            if not new_keys:
+                return
+
+            for key in sorted(new_keys):
+                payload = json.loads(self._load_data_from_r2(key).decode("utf-8"))
+                dim = payload.get("dim", 512)
+                count = payload.get("count", 0)
+                vectors_b64 = payload.get("vectors_b64", "")
+                items = payload.get("items", [])
+
+                if count == 0 or not vectors_b64 or not items:
+                    self.delta_keys.add(key)
+                    continue
+
+                vec_bytes = base64.b64decode(vectors_b64)
+                vectors = np.frombuffer(vec_bytes, dtype=np.float32).reshape(-1, dim)
+                faiss.normalize_L2(vectors)
+
+                if self.faiss_delta_index is None:
+                    self.faiss_delta_index = faiss.IndexFlatIP(dim)
+
+                self.faiss_delta_index.add(vectors)
+                self.vector_mapping_delta.extend(items)
+                self.delta_keys.add(key)
 
     def list_r2_keys(self, prefix: str) -> list[str]:
         keys = []
@@ -1097,13 +1144,60 @@ class IntelligentPDFAnalyzer:
         except Exception as e:
             logger.error(f"❌ R2 Upload Failed ({key}): {e}")
             return False
+
+    def write_delta_from_index(self, index_key: str) -> str:
+        index_bytes = self._load_data_from_r2(index_key)
+        if not index_bytes:
+            raise RuntimeError(f"index.json not found: {index_key}")
+
+        index_data = json.loads(index_bytes.decode("utf-8"))
+        current = index_data.get("current_revision") or {}
+        vector_bin_key = current.get("vector_bin")
+        if not vector_bin_key:
+            raise RuntimeError("vector_bin is missing in index.json")
+
+        vec_bytes = self._load_data_from_r2(vector_bin_key)
+        if not vec_bytes:
+            raise RuntimeError(f"vector.bin not found: {vector_bin_key}")
+
+        vecs = np.frombuffer(vec_bytes, dtype=np.float32).reshape(-1, 512)
+
+        vector_items = []
+        for v in index_data.get("vectors", []):
+            vector_items.append({
+                "offset": v.get("offset"),
+                "drawing_uid": index_data.get("drawing_uid"),
+                "role": v.get("role"),
+                "part_id": v.get("part_id"),
+                "page": v.get("page"),
+                "bbox": v.get("bbox"),
+                "image_key": v.get("image_key"),
+                "base_dir": current.get("base_dir"),
+                "vector": vecs[v["offset"]],
+            })
+
+        delta_payload = build_delta_payload(vector_items)
+        delta_key = f"{DELTA_PREFIX}{int(time.time())}_{index_data.get('drawing_uid')}.json"
+        ok = self.upload_bytes_to_r2(
+            json.dumps(delta_payload, ensure_ascii=False).encode("utf-8"),
+            delta_key,
+            "application/json",
+        )
+        if not ok:
+            raise RuntimeError("delta upload failed")
+
+        return delta_key
+
+    def write_delta_for_drawing(self, drawing_uid: str) -> str:
+        index_key = f"drawings/{drawing_uid}/index.json"
+        return self.write_delta_from_index(index_key)
     
 
 
 
     def save_ocr(self, pdf_bytes: bytes, img_bytes: bytes, parts_data: List, total_pages: int, batch_id: str) -> dict[str, str]:
         print("OCR保存処理開始")
-
+        
         start_time = time.time()
         ts = int(time.time()*1000)
         total_time = start_time
@@ -1111,18 +1205,31 @@ class IntelligentPDFAnalyzer:
         pdf_sha256 = pdf_bytes_to_sha(img_bytes)
         drawing_uid = decide_drawing_uid(pdf_sha256)
         rawimg = img_bytes
-        #ok, jpeg = cv2.imencode(".jpg", rawimg, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-        #if not ok:
-        #    raise RuntimeError("JPEG encode failed")
+
+        ocrImg = rawimg
+        # Gemini OCR前に表示用正位置へ補正
+        _img_np = cv2.imdecode(np.frombuffer(rawimg, np.uint8), cv2.IMREAD_COLOR)
+        display_deg = detect_display_orientation(_img_np)
+        if display_deg == 90:
+            _img_np = cv2.rotate(_img_np, cv2.ROTATE_90_CLOCKWISE)
+        elif display_deg == 180:
+            _img_np = cv2.rotate(_img_np, cv2.ROTATE_180)
+        elif display_deg == 270:
+            _img_np = cv2.rotate(_img_np, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        if display_deg != 0:
+            _, _buf = cv2.imencode(".jpg", _img_np, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            ocrImg = _buf.tobytes()
 
         try:
-            result = run_gemi(rawimg)
+            result = run_gemi(ocrImg)
             ocr_result, gemiPrice = result if result else ({}, 0)
         except Exception as e:
             logger.error(f"❌ gemi-OCRエラー: {e}")
             raise
         
         print(f"🧾 OCR:費用{gemiPrice:.3f}円, {ocr_result},秒数: {time.time() - start_time:.2f}s, トータル時間: {time.time() - total_time:.2f}s")
+        #return {"status": "ocr_test", "ocr_result": ocr_result}  # TODO: テスト用停止点・削除すること
         start_time = time.time()
         if ocr_result.get("drawing_number"):
             drawing_number = str(ocr_result.get("drawing_number"))
@@ -1159,7 +1266,7 @@ class IntelligentPDFAnalyzer:
                         "part_id": part_id,
                         "b64_image": base64.b64encode(part_bytes).decode("utf-8")
                     })
-        revision_id = save_ocr_revision(drawing_uid, ocr_result, drawing_number, enriched_tags, f"{base_dir}/raw.pdf", f"{base_dir}/ocr.pdf", f"{base_dir}/fullpage.jpg", f"{base_dir}/raw.jpg", parts)
+        revision_id = save_ocr_revision(drawing_uid, ocr_result, drawing_number, enriched_tags, f"{base_dir}/raw.pdf", f"{base_dir}/ocr.pdf", f"{base_dir}/fullpage.jpg", f"{base_dir}/raw.jpg", parts, display_deg)
         save_revision_tags(revision_id, ocr_result)
         print(f"💾 DB保存完了, 秒数: {time.time() - start_time:.2f}s, トータル時間: {time.time() - total_time:.2f}s")
         start_time = time.time()
@@ -1181,15 +1288,41 @@ class IntelligentPDFAnalyzer:
         logger.info(f"💾 r2図面保存完了: {base_dir},秒数: {time.time() - start_time:.2f}s, トータル時間: {time.time() - total_time:.2f}s")
 
         start_time = time.time()
-        base_keys = check_batch(batch_id, base_dir, total_pages, parts_json)
-        #base_keys = check_batcha("50194477")
-        if not base_keys:
-            logger.info(f"CLIP対象貯蓄中")
-            return {"base_dir": base_dir, "status": "ok"}
-        self.save_clip(base_keys=base_keys["revs"], all_parts_bytes=base_keys["all_bytes"])
-        if base_keys["is_last_batch"]:
-            logger.info(f"🚀 最後の1件、バッチCLIP処理開始、全{total_pages}件、バッチID: {batch_id}")
-            batch_clear(batch_id)
+        try:
+            base_keys = check_batch(batch_id, base_dir, total_pages, parts_json)
+            #base_keys = check_batcha("50194477")
+            if not base_keys:
+                logger.info(f"CLIP対象貯蓄中")
+                return {"base_dir": base_dir, "status": "ok"}
+            mark_batch_processing(base_keys["base_dirs"])
+            clip_ok = False
+            try:
+                vector_count = self.save_clip(base_keys=base_keys["revs"], all_parts_bytes=base_keys["all_bytes"])
+                clip_ok = bool(vector_count)
+            except Exception:
+                logger.error("❌ save_clip exception", exc_info=True)
+                clip_ok = False
+
+            if clip_ok:
+                mark_batch_done(base_keys["base_dirs"])
+            else:
+                mark_batch_failed(base_keys["base_dirs"])
+                logger.warning("⚠️ save_clip failed. marked as failed")
+            if base_keys["is_last_batch"] and clip_ok:
+                logger.info(f"🚀 最後の1件、バッチCLIP処理開始、全{total_pages}件、バッチID: {batch_id}")
+                batch_clear(batch_id)
+        except Exception:
+            logger.error("❌ batch enqueue/clip flow failed", exc_info=True)
+            try:
+                deleted = delete_prefix_from_r2(self.s3, self.bucket_name, f"{base_dir}/")
+                logger.warning(f"🧹 rollback R2 prefix: {base_dir}/ deleted={deleted}")
+            except Exception:
+                logger.error(f"❌ rollback R2 failed: {base_dir}/", exc_info=True)
+            try:
+                mark_batch_failed([base_dir])
+            except Exception:
+                logger.error(f"❌ mark failed fallback error: {base_dir}", exc_info=True)
+            raise
         #logger.info(f"🚀 バッチCLIP処理完了、全{len(base_keys)}件、秒数: {time.time() - start_time:.2f}s, トータル時間: {time.time() - total_time:.2f}s")
         return {"base_dir": base_dir, "status": "ok"}
     
@@ -1254,15 +1387,8 @@ class IntelligentPDFAnalyzer:
                 base_key = rec["base_dir"]
                 pdf_url = rec["pdf_url"]
                 parts = rec.get("parts", [])
-                all_revisions.append(rec)
-                #meta_key = f"{base_key}/metadata.json"
-                #meta_bytes = self._load_data_from_r2(meta_key)
-                #if not meta_bytes: continue
-                
-                #metadata = json.loads(meta_bytes.decode('utf-8'))                
+                all_revisions.append(rec)              
                 logger.info(f"✅ supadata読み込み完了")
-                #return
-                # B. PDFを読み込み、CLIP用のメイン画像PNGをメモリで生成
                 img_bytes = self._load_data_from_r2(base_key + "/fullpage.jpg")
                 if not img_bytes: continue
                 all_images_to_send.append({
@@ -1296,8 +1422,6 @@ class IntelligentPDFAnalyzer:
             return
 
         print(f" vector_map keys: {list(vector_map.keys())}")
-        # Phase 3: 結果のベクトルを各メタデータに追記し、R2に書き戻す
-        # ----------------------------------------------------
         shard_vector_items: list[dict] = []
         for vision in all_revisions:
             base_key = vision["base_dir"]
@@ -1315,7 +1439,8 @@ class IntelligentPDFAnalyzer:
             bin_bytes = vec.tobytes()
 
             bin_key = f"{base_key}/vector.bin"
-            self.upload_bytes_to_r2(bin_bytes, bin_key, "application/octet-stream")
+            if not self.upload_bytes_to_r2(bin_bytes, bin_key, "application/octet-stream"):
+                raise RuntimeError(f"vector.bin upload failed: {bin_key}")
 
 
             index = {
@@ -1331,7 +1456,7 @@ class IntelligentPDFAnalyzer:
             index["vectors"].append({
                 "offset": 0,
                 "role": "main",
-                "image_key": "fullpage.png"
+                "image_key": f'{vision["base_dir"]}/fullpage.jpg'
             })
 
             # parts
@@ -1346,11 +1471,12 @@ class IntelligentPDFAnalyzer:
                 })
 
             index_key = f'drawings/{vision["drawing_uid"]}/index.json'
-            self.upload_bytes_to_r2(
+            if not self.upload_bytes_to_r2(
                 json.dumps(index, ensure_ascii=False, indent=2).encode("utf-8"),
                 index_key,
                 "application/json"
-            )
+            ):
+                raise RuntimeError(f"index.json upload failed: {index_key}")
 
             # --- ★ vector_items 組み立て（drawing単位） ---
             vector_items = assemble_vector_items(
@@ -1360,6 +1486,15 @@ class IntelligentPDFAnalyzer:
                 ],
                 meta_data=vision,
             )
+
+            delta_payload = build_delta_payload(vector_items)
+            delta_key = f"{DELTA_PREFIX}{int(time.time())}_{vision['drawing_uid']}.json"
+            if not self.upload_bytes_to_r2(
+                json.dumps(delta_payload, ensure_ascii=False).encode("utf-8"),
+                delta_key,
+                "application/json"
+            ):
+                raise RuntimeError(f"delta upload failed: {delta_key}")
 
             # --- ★ shard 全体に追加 ---
             shard_vector_items.extend(vector_items)

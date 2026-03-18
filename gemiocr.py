@@ -1,6 +1,5 @@
 from google import genai
 from google.genai import types
-import json
 import os
 import datetime
 from dotenv import load_dotenv
@@ -24,8 +23,9 @@ def run_gemi(jpeg_bytes):
 "free_hand_text": "",
 }
 [注意事項]
--material_sizeに関してはthickness_min:部材の「板厚」(図面内最小値),width_max:部材の「幅」(図面内最大値).
--outer_max重要指示:部材の「切断長」(図面内最大値).形鋼は断面でなく長さを記載.
+-thickness_min:板厚を記載。shape_categoryに応じて読み方を変える。「板金(曲げ有)」→「t=X」「t X」表記を最優先で探す(例:材質欄「SUS304 t=1.5」,寸法線のt値)。「板物(平板)」「角物(フライス)」→t=表記がなければ外形寸法のうち最も小さい値(板厚方向)を記載。丸物は最小断面寸法。見つからない場合は0。
+-width_max:部材外形の「幅」。正面図または平面図の水平方向最大寸法(外形の横サイズ)。寸法補助線の数値から読む。見つからない場合は0。
+-outer_max:部材外形の「丈/長さ」。図面全体で最も大きい外形寸法値。形鋼は断面でなく全長を記載。見つからない場合は0。
 -free_hand_textに関しては以下すべてを満たす場合のみ文字列を返す。なければ null,活字（ゴシック/明朝）ではない,図面注記欄・表題欄・注記番号付き文章は除外,-手書き特有の歪み・傾き・不揃いが視認できる.
 -dimensionsに関しては主要な数値のみ。JSONを絶対に壊さないこと.
 [カテゴリ]板物(平板),板金(曲げ有),丸物(旋盤),角物(フライス),長尺・形鋼(アングル/パイプ),製缶・組図,その他
@@ -34,12 +34,40 @@ def run_gemi(jpeg_bytes):
     config = types.GenerateContentConfig(
         temperature=0.0,
         max_output_tokens=700,
-        response_mime_type="application/json"
+        response_mime_type="application/json",
+        response_schema=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "drawing_number":    types.Schema(type=types.Type.STRING),
+                "part_name":         types.Schema(type=types.Type.STRING),
+                "material":          types.Schema(type=types.Type.STRING),
+                "surface_treatment": types.Schema(type=types.Type.STRING),
+                "material_size": types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "thickness_min": types.Schema(type=types.Type.NUMBER),
+                        "width_max":     types.Schema(type=types.Type.NUMBER),
+                        "outer_max":     types.Schema(type=types.Type.NUMBER),
+                    }
+                ),
+                "shape_category":  types.Schema(type=types.Type.STRING),
+                "customer":        types.Schema(type=types.Type.STRING),
+                "dimensions":      types.Schema(
+                    type=types.Type.ARRAY,
+                    items=types.Schema(type=types.Type.STRING)
+                ),
+                "processing_info": types.Schema(
+                    type=types.Type.ARRAY,
+                    items=types.Schema(type=types.Type.STRING)
+                ),
+                "free_hand_text":  types.Schema(type=types.Type.STRING, nullable=True),
+            }
+        )
     )
 
     try:
         response = client.models.generate_content(
-            model='gemini-flash-lite-latest', 
+            model='gemini-flash-lite-latest',
             contents=[
                 types.Content(
                     role="user",
@@ -58,15 +86,14 @@ def run_gemi(jpeg_bytes):
         in_tokens = usage.prompt_token_count
         out_tokens = usage.candidates_token_count
         
-        PRICE_IN_PER_1M = 0.1
-        PRICE_OUT_PER_1M = 0.4
+        PRICE_IN_PER_1M = 0.10  #3.1-flash-lite-preview: 0.25
+        PRICE_OUT_PER_1M = 0.40  #3.1-flash-lite-preview: 1.50
         USD_JPY = 155.0
         cost_in_usd = (in_tokens / 1_000_000) * PRICE_IN_PER_1M
         cost_out_usd = (out_tokens / 1_000_000) * PRICE_OUT_PER_1M
         total_usd = cost_in_usd + cost_out_usd
         total_jpy = total_usd * USD_JPY
-        print(f"📊 [Gemini Cost] In: {in_tokens} tokens, Out: {out_tokens} tokens")
-        print(f"💰 [Gemini Cost] Total: ${total_usd:.6f} ({total_jpy:.4f} 円)")
+        print(f"📊 [{used_model}] In:{in_tokens}tok / Out:{out_tokens}tok | ${total_usd:.6f} ({total_jpy:.4f}円)")
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_line = f"{timestamp} | {used_model} | In:{in_tokens} | Out:{out_tokens} | {total_jpy:.4f}円\n"
 
@@ -74,14 +101,10 @@ def run_gemi(jpeg_bytes):
             f.write(log_line)
             
         print(f"📝 Log saved: {total_jpy:.4f}円")
-        raw_text = response.text
-        cleaned_text = raw_text.replace("```json", "").replace("```", "").strip()
-        
-        result_json = json.loads(cleaned_text)
-        if isinstance(result_json  , list):
-            result_json = result_json[0] if result_json else {}
-            return result_json, total_jpy
-        
+        result_json = response.parsed
+        ms = result_json.get("material_size", {})
+        if ms.get("width_max", 0) > ms.get("outer_max", 0):
+            ms["outer_max"] = ms["width_max"]
         return result_json, total_jpy
 
     except Exception as e:

@@ -1,27 +1,30 @@
-fastapi
-uvicorn
+# Web Framework
+fastapi==0.128.0
+uvicorn==0.40.0
+pydantic==2.12.5
 python-multipart
 
-open-clip-torch
-torch==2.2.2+cpu
-torchvision==0.17.2+cpu
---extra-index-url https://download.pytorch.org/whl/cpu
-
-PyMuPDF
-opencv-python
-pillow
-pdf2image
-
+# AI / ML（torchはDockerfileで別途インストール）
+open_clip_torch==2.24.0
 faiss-cpu
+numpy==2.2.0
 
-supabase
-postgrest
-storage3
-realtime
-
-boto3
-pandas
-regex
+# Google Gemini
 google-genai
-python-dotenv
-requests
+
+# PDF / Image
+PyMuPDF
+pdf2image==1.17.0
+Pillow==12.0.0
+opencv-python-headless==4.12.0.88
+
+# Storage / Cloud
+boto3==1.42.9
+botocore==1.42.9
+supabase==2.27.0
+postgrest==2.27.0
+
+# Utility
+python-dotenv==1.2.1
+requests==2.32.5
+httpx

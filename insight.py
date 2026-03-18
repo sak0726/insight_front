@@ -1,7 +1,8 @@
 # main.py - 製造図面解析システム v3.0 統合版
 
 #import cv2
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,8 +15,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 import logging
 import base64
+import threading
 
-from sympy import im
 print("🚀 insight.py ロード開始")
 supabase = None
 _clip_model = None
@@ -43,6 +44,22 @@ def get_cpu_clip():
 intelligent_analyzer = None
 clip_engine = None
 
+faiss_rebuild_state = {
+    "running": False,
+    "pending": False,
+    "last_started_at": None,
+    "last_finished_at": None,
+    "last_status": "idle",
+    "last_error": None,
+    "last_requested_at": None,
+    "last_requested_by": None,
+    "last_requested_path": None,
+}
+_faiss_rebuild_lock = threading.Lock()
+_faiss_rebuild_worker_running = False
+_faiss_rebuild_last_request_ts = 0.0
+_FAISS_REBUILD_DEBOUNCE_SEC = 3.0
+
     
 logger = logging.getLogger(__name__)
 
@@ -60,17 +77,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 静的ファイル配信設定
-upload_dir = Path("public/uploads")
-upload_dir.mkdir(parents=True, exist_ok=True)
-COMPARE_DIR = Path("public/compares") 
-COMPARE_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="public/uploads"), name="uploads")
 
-# 📁 output ディレクトリ配信設定（PNG画像用）
-output_dir = Path("output")
-output_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/output", StaticFiles(directory="output"), name="output")
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    try:
+        body = await request.body()
+        logger.error(f"422 validation error. Body: {body.decode('utf-8')}")
+    except Exception as e:
+        logger.error(f"422 validation error. Failed to read body: {e}")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 
 @app.post("/warmup")
 async def warmup(purpose: str = "common"):
@@ -99,11 +115,8 @@ async def warmup(purpose: str = "common"):
             print("🧠 Loading CPU CLIP model...")
             get_cpu_clip()
 
-            print("🧠 Rebuilding FAISS...")
-            from intelligent_pdf_analyzer import rebuild_faiss
-            rebuild_faiss()
-
             intelligent_analyzer.load_faiss_shard("001")
+            intelligent_analyzer.refresh_delta_index()
             print("🧠 Search engine ready")
 
         logger.info("database load....")
@@ -196,6 +209,85 @@ class DataListResponse(BaseModel):
     product: List[Dict[str, Any]]
 
 
+class UpdateRequest(BaseModel):
+    revision_id: str
+    field: str
+    value: Optional[Any] = None
+    index: Optional[int] = None
+    action: Optional[str] = "update"
+
+
+class DeltaRepairRequest(BaseModel):
+    drawing_uid: str
+
+
+class DeleteDrawingRequest(BaseModel):
+    revision_id: Optional[str] = None
+    drawing_uid: Optional[str] = None
+    rebuild_faiss: Optional[bool] = False
+
+
+def _faiss_rebuild_worker():
+    global _faiss_rebuild_worker_running
+
+    while True:
+        while True:
+            with _faiss_rebuild_lock:
+                pending = bool(faiss_rebuild_state.get("pending"))
+                last_req = _faiss_rebuild_last_request_ts
+            if not pending:
+                with _faiss_rebuild_lock:
+                    _faiss_rebuild_worker_running = False
+                return
+
+            wait_sec = _FAISS_REBUILD_DEBOUNCE_SEC - (time.time() - last_req)
+            if wait_sec <= 0:
+                break
+            time.sleep(min(wait_sec, 0.5))
+
+        with _faiss_rebuild_lock:
+            faiss_rebuild_state["pending"] = False
+            faiss_rebuild_state["running"] = True
+            faiss_rebuild_state["last_started_at"] = datetime.now(timezone.utc).isoformat()
+            faiss_rebuild_state["last_status"] = "running"
+            faiss_rebuild_state["last_error"] = None
+
+        try:
+            import importlib
+            module = importlib.import_module("intelligent_pdf_analyzer")
+            module.rebuild_faiss()
+            with _faiss_rebuild_lock:
+                faiss_rebuild_state["last_status"] = "ok"
+        except Exception as e:
+            logger.error(f"❌ rebuild_faiss background task error: {e}", exc_info=True)
+            with _faiss_rebuild_lock:
+                faiss_rebuild_state["last_status"] = "error"
+                faiss_rebuild_state["last_error"] = str(e)
+        finally:
+            with _faiss_rebuild_lock:
+                faiss_rebuild_state["running"] = False
+                faiss_rebuild_state["last_finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _request_faiss_rebuild(source: Optional[str] = None, path: Optional[str] = None):
+    global _faiss_rebuild_worker_running, _faiss_rebuild_last_request_ts
+
+    with _faiss_rebuild_lock:
+        faiss_rebuild_state["pending"] = True
+        faiss_rebuild_state["last_requested_at"] = datetime.now(timezone.utc).isoformat()
+        faiss_rebuild_state["last_requested_by"] = source
+        faiss_rebuild_state["last_requested_path"] = path
+        _faiss_rebuild_last_request_ts = time.time()
+
+        if _faiss_rebuild_worker_running:
+            return
+
+        _faiss_rebuild_worker_running = True
+
+    thread = threading.Thread(target=_faiss_rebuild_worker, daemon=True)
+    thread.start()
+
+
 def get_full_page_images(dir_path: Path) -> List[Path]:
     """🔍 全ページ画像ファイルを取得（全自動検索用）- 切り抜きではなくPDF全体のページ画像"""
     image_files = []
@@ -243,18 +335,6 @@ def get_all_image_files(dir_path: Path) -> List[Path]:
     
     return image_files
 
-def rotate_image(img, angle):
-    import cv2
-    if angle == 90:
-        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-    elif angle == 180:
-        return cv2.rotate(img, cv2.ROTATE_180)
-    elif angle == 270:
-        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return img
-
-
-
 @app.get("/health")
 async def health_check():
     """ヘルスチェック（既存Node.js互換）"""
@@ -270,16 +350,6 @@ def sanitize(value):
     if isinstance(value, dict):
         return {k: sanitize(v) for k, v in value.items()}
     return value
-
-def resize_long_edge(img, target=1024):
-    import cv2
-
-    h, w = img.shape[:2]
-    long = max(h, w)
-    scale = target / long
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 def crop_to_content(img):
     import cv2
@@ -422,9 +492,93 @@ async def save_files(pdf: List[UploadFile] = File(...), img64:List[UploadFile] =
         status = result.get("status")
         if not status or status != "ok":
             raise Exception("R2キーの取得に失敗しました。")
+        elif status == "ocr_test":
+            return {"status": "ocr_test", "ocr_result": result.get("ocr_result")}
+        return {"status": "ok"}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ OCR,labeling Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"OCR,labeling Error: {str(e)}")
+@app.get("/batch_progress/{batch_id}")
+async def batch_progress(batch_id: str):
+    from insight_db import supabase, _execute_with_retry
+
+    def _count_by_status(status: Optional[str] = None) -> int:
+        def _op():
+            q = (
+                supabase
+                .table("drawing_batch_items")
+                .select("base_dir", count="exact")
+                .eq("batch_id", batch_id)
+            )
+            if status:
+                q = q.eq("status", status)
+            return q.execute()
+
+        resp = _execute_with_retry(_op, retries=5, base_sleep=0.3)
+        return int(resp.count or 0)
+
+    total = _count_by_status()
+    queued = _count_by_status("queued")
+    processing = _count_by_status("processing")
+    done = _count_by_status("done")
+    failed = _count_by_status("failed")
+
+    return {
+        "total": total,
+        "queued": queued,
+        "processing": processing,
+        "done": done,
+        "failed": failed,
+    }
+
+
+@app.post("/batch_retry/{batch_id}")
+async def batch_retry(batch_id: str, limit: int = 10):
+    from insight_db import retry_failed_batch, mark_batch_processing, mark_batch_done, mark_batch_failed
+    global intelligent_analyzer
+
+    if intelligent_analyzer is None:
+        import importlib
+        module = importlib.import_module("intelligent_pdf_analyzer")
+        IntelligentPDFAnalyzer = module.IntelligentPDFAnalyzer
+        intelligent_analyzer = IntelligentPDFAnalyzer()
+
+    base_keys = retry_failed_batch(batch_id, limit=limit)
+    if not base_keys:
+        return {"status": "noop", "message": "no failed rows", "batch_id": batch_id}
+
+    base_dirs = base_keys["base_dirs"]
+    mark_batch_processing(base_dirs)
+
+    try:
+        vector_count = await asyncio.to_thread(
+            intelligent_analyzer.save_clip,
+            base_keys["revs"],
+            base_keys["all_bytes"],
+        )
+    except Exception as e:
+        mark_batch_failed(base_dirs)
+        raise HTTPException(status_code=500, detail=f"retry failed: {str(e)}")
+
+    if vector_count:
+        mark_batch_done(base_dirs)
+        return {
+            "status": "ok",
+            "batch_id": batch_id,
+            "processed": len(base_dirs),
+            "vector_count": int(vector_count),
+        }
+
+    mark_batch_failed(base_dirs)
+    return {
+        "status": "failed",
+        "batch_id": batch_id,
+        "processed": len(base_dirs),
+        "vector_count": 0,
+    }
 
 def faiss_search(query_vec_torch, top_k=100):
     import faiss
@@ -443,8 +597,13 @@ def faiss_search(query_vec_torch, top_k=100):
             detail="FAISS index not loaded."
         )
 
+    intelligent_analyzer.refresh_delta_index()
+
     faiss_index = intelligent_analyzer.faiss_index
     items = intelligent_analyzer.vector_mapping
+    delta_index = getattr(intelligent_analyzer, "faiss_delta_index", None)
+    delta_items = getattr(intelligent_analyzer, "vector_mapping_delta", [])
+    logger.info(f"🔍 FAISS base vectors: {len(items)} / delta vectors: {len(delta_items)}")
 
     # query_vec_torch: torch.Tensor [1, dim], float32, 正規化済み
     scores, ids = faiss_index.search(query_vec_torch, top_k)
@@ -452,24 +611,31 @@ def faiss_search(query_vec_torch, top_k=100):
 
     best_by_drawing = {}
 
-    for score, idx in zip(scores[0], ids[0]):
-        if idx < 0 or idx >= len(items):
-            continue
+    def accumulate(score_list, id_list, mapping):
+        for score, idx in zip(score_list, id_list):
+            if idx < 0 or idx >= len(mapping):
+                continue
 
-        meta = items[idx]
-        uid = meta["drawing_uid"]
+            meta = mapping[idx]
+            uid = meta["drawing_uid"]
 
-        adj_score = float(score)
-        if meta["role"] == "main":
-            adj_score += 0.01  # optional
+            adj_score = float(score)
+            if meta.get("role") == "main":
+                adj_score += 0.01
 
-        prev = best_by_drawing.get(uid)
-        if (prev is None) or (adj_score > prev["score"]):
-            best_by_drawing[uid] = {
-                "score": adj_score,
-                "best_idx": int(idx),      # どの vector が代表になったか（デバッグ用）
-                "best_role": meta["role"], # 同上
-            }
+            prev = best_by_drawing.get(uid)
+            if (prev is None) or (adj_score > prev["score"]):
+                best_by_drawing[uid] = {
+                    "score": adj_score,
+                    "best_idx": int(idx),
+                    "best_role": meta.get("role"),
+                }
+
+    accumulate(scores[0], ids[0], items)
+    if delta_index is not None and delta_items:
+        delta_scores, delta_ids = delta_index.search(query_vec_torch, top_k)
+        logger.info(f"🔍 Delta search size: {len(delta_scores[0])}")
+        accumulate(delta_scores[0], delta_ids[0], delta_items)
 
     results = []
     for uid, info in best_by_drawing.items():
@@ -497,26 +663,37 @@ def faiss_search_single(query_vec_torch, top_k=10):
     if intelligent_analyzer is None:
         raise HTTPException(503, "System not warmed up")
 
+    intelligent_analyzer.refresh_delta_index()
+
     faiss_index = intelligent_analyzer.faiss_index
     items = intelligent_analyzer.vector_mapping
+    delta_index = getattr(intelligent_analyzer, "faiss_delta_index", None)
+    delta_items = getattr(intelligent_analyzer, "vector_mapping_delta", [])
 
     scores, ids = faiss_index.search(query_vec_torch, top_k)
 
     # --- 1. drawing_uid 単位でスコア集約 ---
     best_by_drawing = {}
-    for score, idx in zip(scores[0], ids[0]):
-        if idx < 0 or idx >= len(items):
-            continue
+    def accumulate(score_list, id_list, mapping):
+        for score, idx in zip(score_list, id_list):
+            if idx < 0 or idx >= len(mapping):
+                continue
 
-        uid = items[idx]["drawing_uid"]
-        if uid not in best_by_drawing or score > best_by_drawing[uid]["score"]:
-            best_by_drawing[uid] = {"score": float(score)}
+            uid = mapping[idx]["drawing_uid"]
+            if uid not in best_by_drawing or score > best_by_drawing[uid]["score"]:
+                best_by_drawing[uid] = {"score": float(score)}
+
+    accumulate(scores[0], ids[0], items)
+    if delta_index is not None and delta_items:
+        delta_scores, delta_ids = delta_index.search(query_vec_torch, top_k)
+        accumulate(delta_scores[0], delta_ids[0], delta_items)
 
     # --- 2. main meta を引く ---
+    merged_items = items + (delta_items or [])
     main_meta_by_uid = {
         item["drawing_uid"]: item
-        for item in items
-        if item["role"] == "main"
+        for item in merged_items
+        if item.get("role") == "main"
     }
 
     # --- 3. main だけ返す ---
@@ -539,10 +716,16 @@ def faiss_search_single(query_vec_torch, top_k=10):
 
 def build_final_results(top_results):
     final_results = []
+    sorted_results = sorted(
+        top_results.get("results", []),
+        key=lambda x: float(x.get("score", 0.0)),
+        reverse=True,
+    )
 
-    for item in top_results["results"]:
+    for item in sorted_results:
         base_dir = item["base_dir"]
-        sim = item["score"]
+        raw_score = float(item.get("score", 0.0))
+        sim = max(0.0, min(1.0, raw_score))
 
 
         # rotation（存在しなければ 0）
@@ -649,7 +832,7 @@ async def handle_auto_full_search(rawimg) -> SearchResponse:
         vec = vec / vec.norm(dim=-1, keepdim=True)
         query_vec = vec.contiguous()
 
-        top_results = faiss_search(query_vec, top_k=10)
+        top_results = faiss_search(query_vec, top_k=30)
         logger.info(f"🎯 FAISS検索結果: {len(top_results)} 件")
         return build_final_results(top_results)
 
@@ -690,7 +873,7 @@ async def handle_single_part_search(images: List[UploadFile]) -> SearchResponse:
         vec = vec / vec.norm(dim=-1, keepdim=True)
         query_vec = vec.contiguous()
 
-        top_results = faiss_search_single(query_vec, top_k=10)
+        top_results = faiss_search_single(query_vec, top_k=30)
         print(top_results)
         return build_final_results(top_results)
 
@@ -700,31 +883,7 @@ async def handle_single_part_search(images: List[UploadFile]) -> SearchResponse:
         return SearchResponse(success=False, results=[])
     
 
-def load_ai_features(folder_path: Path) -> Optional[Dict[str, Any]]:
 
-    """指定フォルダの ai_features.json を読み込む"""
-    json_path = folder_path / "ai_features.json"
-    if not json_path.exists():
-        logger.warning(f"⚠️ ai_features.json が存在しません: {json_path}")
-        return None
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"❌ ai_features.json 読み込みエラー ({json_path}): {e}")
-        return None
-def cosine_similarity(v1, v2):
-    import numpy as np
-
-    """ゼロ除算を回避した安全なコサイン類似度"""
-    v1 = np.array(v1, dtype=float)
-    v2 = np.array(v2, dtype=float)
-
-    n1 = np.linalg.norm(v1)
-    n2 = np.linalg.norm(v2)
-    if n1 == 0 or n2 == 0:
-        return 0.0
-    return float(np.dot(v1, v2) / (n1 * n2))    
 
 
 
@@ -757,35 +916,33 @@ async def get_data_list(limit: int = 25, offset: int = 0):
 
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    resp = (
+    # Step1: drawingsをupdated_at降順でページネーション（軽量）
+    drawings_resp = (
         supabase
         .table("drawings")
-        .select(
-            """
-            drawing_uid,
-            drawing_revisions!drawing_revisions_drawing_uid_fkey!inner(
-                revision_id,
-                drawing_number,
-                parts_name,
-                material,
-                surface,
-                thick,
-                width,
-                length,
-                shape,
-                orientation_deg,
-                img_url,
-                pdf_url,
-                tags_json,
-                parts,
-                updated_at
-            )
-            """
-        )
-        .order("updated_at", desc=True, foreign_table="drawing_revisions")
+        .select("drawing_uid, current_revision_id, updated_at")
+        .order("updated_at", desc=True)
         .range(offset, offset + limit - 1)
         .execute()
     )
+
+    # Step2: 取得したcurrent_revision_idでrevisionを一括取得（PKルックアップ）
+    rev_ids = [r["current_revision_id"] for r in drawings_resp.data if r.get("current_revision_id")]
+    revs_resp = (
+        supabase
+        .table("drawing_revisions")
+        .select("revision_id, drawing_uid, drawing_number, parts_name, material, surface, thick, width, length, shape, orientation_deg, img_url, pdf_url, tags_json, parts, updated_at")
+        .in_("revision_id", rev_ids)
+        .execute()
+    )
+    revs_map = {r["revision_id"]: r for r in revs_resp.data}
+
+    # drawingsの順序を維持しながらrevisionをマージ
+    resp_data = []
+    for d in drawings_resp.data:
+        rev = revs_map.get(d.get("current_revision_id"))
+        if rev:
+            resp_data.append({"drawing_uid": d["drawing_uid"], "drawing_revisions": [rev]})
 
     count_resp = (
         supabase
@@ -794,10 +951,10 @@ async def get_data_list(limit: int = 25, offset: int = 0):
         .execute()
     )
     total = count_resp.count
-    print(len(resp.data), total)
+    print(len(resp_data), total)
     items = []
-    if resp.data:
-        for row in resp.data:
+    if resp_data:
+        for row in resp_data:
             revs = row.get("drawing_revisions")
             if not revs or len(revs) == 0:  # リストが空またはNoneの場合を考慮
                 continue
@@ -828,6 +985,428 @@ async def get_data_list(limit: int = 25, offset: int = 0):
         "items": items,
         "total": total,
     }
+@app.get("/data-search")
+async def data_search(
+    query: str = "",
+    name: str = "",
+    material: str = "",
+    shape: str = "",
+    thicknessMin: Optional[float] = None,
+    thicknessMax: Optional[float] = None,
+    widthMin: Optional[float] = None,
+    widthMax: Optional[float] = None,
+    heightMin: Optional[float] = None,
+    heightMax: Optional[float] = None,
+    limit: int = 25,
+    offset: int = 0,
+):
+    global supabase
+
+    has_query = str(query or "").strip() != ""
+    has_detail = any([
+        str(name or "").strip() != "",
+        str(material or "").strip() != "",
+        str(shape or "").strip() != "",
+        thicknessMin is not None,
+        thicknessMax is not None,
+        widthMin is not None,
+        widthMax is not None,
+        heightMin is not None,
+        heightMax is not None,
+    ])
+
+    if not has_query and not has_detail:
+        return {
+            "items": [],
+            "total": 0,
+        }
+
+    if os.getenv("K_SERVICE") is None:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(".env")
+        except Exception:
+            pass
+
+    if supabase is None:
+        SUPABASE_URL = os.getenv("SUPABASE_URL")
+        SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            logger.warning("SUPABASE env vars are not set. Supabase disabled.")
+            supabase = None
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "partial",
+                    "message": "Models loaded, Supabase disabled",
+                },
+            )
+
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    like_query = f"%{query}%" if has_query else None
+    like_name = f"%{name}%" if str(name or "").strip() != "" else None
+    like_material = f"%{material}%" if str(material or "").strip() != "" else None
+    like_shape = f"%{shape}%" if str(shape or "").strip() != "" else None
+
+    def apply_filters(builder):
+        if like_query:
+            builder = builder.ilike("drawing_number", like_query)
+        if like_name:
+            builder = builder.ilike("parts_name", like_name)
+        if like_material:
+            builder = builder.ilike("material", like_material)
+        if like_shape:
+            builder = builder.ilike("shape", like_shape)
+
+        if thicknessMin is not None:
+            builder = builder.gte("thick", thicknessMin)
+        if thicknessMax is not None:
+            builder = builder.lte("thick", thicknessMax)
+        if widthMin is not None:
+            builder = builder.gte("width", widthMin)
+        if widthMax is not None:
+            builder = builder.lte("width", widthMax)
+        if heightMin is not None:
+            builder = builder.gte("length", heightMin)
+        if heightMax is not None:
+            builder = builder.lte("length", heightMax)
+
+        return builder
+
+    resp = apply_filters(
+        supabase
+        .table("drawing_revisions")
+        .select(
+            """
+            revision_id,
+            drawing_uid,
+            drawing_number,
+            parts_name,
+            material,
+            surface,
+            thick,
+            width,
+            length,
+            shape,
+            orientation_deg,
+            img_url,
+            pdf_url,
+            tags_json,
+            parts,
+            updated_at
+            """
+        )
+    )
+    resp = (
+        resp
+        .order("updated_at", desc=True)
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
+
+    count_resp = apply_filters(
+        supabase
+        .table("drawing_revisions")
+        .select(
+            """
+            revision_id
+            """,
+            count="estimated",
+        )
+    ).execute()
+    total = count_resp.count
+
+    items = []
+    if resp.data:
+        for rev in resp.data:
+            items.append({
+                "drawing_uid": rev.get("drawing_uid"),
+                "revision_id": rev.get("revision_id"),
+                "drawing_number": rev.get("drawing_number"),
+                "parts_name": rev.get("parts_name"),
+                "material": rev.get("material"),
+                "surface": rev.get("surface"),
+                "thick": rev.get("thick"),
+                "width": rev.get("width"),
+                "length": rev.get("length"),
+                "shape": rev.get("shape"),
+                "orientation_deg": rev.get("orientation_deg"),
+                "preview_url": build_public_url(rev.get("img_url")),
+                "pdf_url": build_public_url(rev.get("pdf_url")),
+                "tags_json": rev.get("tags_json"),
+                "parts": build_parts_public(rev.get("parts")),
+                "updated_at": rev.get("updated_at"),
+            })
+
+    return {
+        "items": items,
+        "total": total,
+    }
+
+
+@app.post("/data_update")
+async def data_update(payload: UpdateRequest):
+    from supabase import create_client
+    global supabase
+
+    if os.getenv("K_SERVICE") is None:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(".env")
+        except Exception:
+            pass
+
+    if supabase is None:
+        SUPABASE_URL = os.getenv("SUPABASE_URL")
+        SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            logger.warning("SUPABASE env vars are not set. Supabase disabled.")
+            supabase = None
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "partial",
+                    "message": "Models loaded, Supabase disabled",
+                },
+            )
+
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    allowed_fields = {
+        "drawing_number",
+        "parts_name",
+        "material",
+        "surface",
+        "thick",
+        "width",
+        "length",
+        "shape",
+        "orientation_deg",
+    }
+    tag_fields = {"dimensions", "processing_info"}
+
+    field = payload.field
+    value = payload.value
+    action = (payload.action or "update").lower()
+
+    if field in tag_fields:
+        if payload.index is None:
+            raise HTTPException(status_code=400, detail="index is required for tag updates")
+
+        resp = (
+            supabase
+            .table("drawing_revisions")
+            .select("tags_json")
+            .eq("revision_id", payload.revision_id)
+            .single()
+            .execute()
+        )
+        tags = resp.data.get("tags_json") if resp and resp.data else None
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except Exception:
+                tags = None
+        if not isinstance(tags, dict):
+            tags = {"dimensions": [], "processing_info": []}
+
+        current_list = tags.get(field)
+        if not isinstance(current_list, list):
+            current_list = []
+
+        index = payload.index
+        if action == "delete":
+            if 0 <= index < len(current_list):
+                current_list.pop(index)
+        else:
+            while len(current_list) <= index:
+                current_list.append("")
+            current_list[index] = "" if value is None else str(value)
+        tags[field] = current_list
+
+        (
+            supabase
+            .table("drawing_revisions")
+            .update({"tags_json": tags})
+            .eq("revision_id", payload.revision_id)
+            .execute()
+        )
+
+        return {"status": "ok", "tags_json": tags}
+
+    if field not in allowed_fields:
+        raise HTTPException(status_code=400, detail="field is not allowed")
+
+    if action == "delete":
+        value = None
+    elif value == "":
+        value = None
+
+    (
+        supabase
+        .table("drawing_revisions")
+        .update({field: value})
+        .eq("revision_id", payload.revision_id)
+        .execute()
+    )
+
+    return {"status": "ok"}
+
+
+@app.post("/delta_repair")
+async def delta_repair(payload: DeltaRepairRequest):
+    global intelligent_analyzer
+    if intelligent_analyzer is None:
+        import importlib
+        module = importlib.import_module("intelligent_pdf_analyzer")
+        IntelligentPDFAnalyzer = module.IntelligentPDFAnalyzer
+        intelligent_analyzer = IntelligentPDFAnalyzer()
+
+    try:
+        delta_key = intelligent_analyzer.write_delta_for_drawing(payload.drawing_uid)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"status": "ok", "delta_key": delta_key}
+
+
+@app.post("/data_delete")
+async def data_delete(payload: DeleteDrawingRequest):
+    from supabase import create_client
+    global supabase
+
+    if not payload.revision_id and not payload.drawing_uid:
+        raise HTTPException(status_code=400, detail="revision_id or drawing_uid is required")
+
+    if os.getenv("K_SERVICE") is None:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(".env")
+        except Exception:
+            pass
+
+    if supabase is None:
+        SUPABASE_URL = os.getenv("SUPABASE_URL")
+        SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise HTTPException(status_code=503, detail="Supabase is not configured")
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    drawing_uid = payload.drawing_uid
+    if not drawing_uid:
+        rev_resp = (
+            supabase
+            .table("drawing_revisions")
+            .select("drawing_uid")
+            .eq("revision_id", payload.revision_id)
+            .limit(1)
+            .execute()
+        )
+        if not rev_resp.data:
+            raise HTTPException(status_code=404, detail="revision not found")
+        drawing_uid = rev_resp.data[0]["drawing_uid"]
+
+    rev_rows = (
+        supabase
+        .table("drawing_revisions")
+        .select("revision_id,base_dir")
+        .eq("drawing_uid", drawing_uid)
+        .execute()
+    ).data or []
+
+    revision_ids = [r["revision_id"] for r in rev_rows if r.get("revision_id")]
+    base_dirs = [r["base_dir"] for r in rev_rows if r.get("base_dir")]
+
+    if revision_ids:
+        (
+            supabase
+            .table("drawing_revision_tags")
+            .delete()
+            .in_("revision_id", revision_ids)
+            .execute()
+        )
+
+    if base_dirs:
+        (
+            supabase
+            .table("drawing_batch_items")
+            .delete()
+            .in_("base_dir", base_dirs)
+            .execute()
+        )
+
+    (
+        supabase
+        .table("drawing_revisions")
+        .delete()
+        .eq("drawing_uid", drawing_uid)
+        .execute()
+    )
+    (
+        supabase
+        .table("drawings")
+        .delete()
+        .eq("drawing_uid", drawing_uid)
+        .execute()
+    )
+
+    deleted_r2_keys = 0
+    try:
+        import importlib
+        module = importlib.import_module("intelligent_pdf_analyzer")
+        connect_r2 = module.connect_r2
+        delete_prefix_from_r2 = module.delete_prefix_from_r2
+        list_keys_from_r2 = module.list_keys_from_r2
+        DELTA_PREFIX = module.DELTA_PREFIX
+
+        s3 = connect_r2()
+        bucket_name = os.getenv("R2_BUCKET_NAME")
+        if bucket_name:
+            deleted_r2_keys += delete_prefix_from_r2(s3, bucket_name, f"drawings/{drawing_uid}/")
+            delta_keys = [k for k in list_keys_from_r2(s3, bucket_name, DELTA_PREFIX) if f"_{drawing_uid}.json" in k]
+            if delta_keys:
+                s3.delete_objects(
+                    Bucket=bucket_name,
+                    Delete={"Objects": [{"Key": k} for k in delta_keys]}
+                )
+                deleted_r2_keys += len(delta_keys)
+
+            if payload.rebuild_faiss:
+                _request_faiss_rebuild(source="data_delete", path="/data_delete")
+    except Exception as e:
+        logger.error(f"❌ R2 delete/rebuild error: {e}", exc_info=True)
+
+    return {
+        "status": "ok",
+        "drawing_uid": drawing_uid,
+        "deleted_revisions": len(revision_ids),
+        "deleted_base_dirs": len(base_dirs),
+        "deleted_r2_keys": deleted_r2_keys,
+        "rebuild_started": bool(payload.rebuild_faiss),
+    }
+
+
+@app.get("/faiss_rebuild_status")
+async def faiss_rebuild_status():
+    with _faiss_rebuild_lock:
+        return dict(faiss_rebuild_state)
+
+
+@app.post("/faiss_rebuild_request")
+async def faiss_rebuild_request(request: Request):
+    client_host = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+    logger.info(f"🔁 faiss_rebuild_request from {client_host} ua={user_agent}")
+    _request_faiss_rebuild(
+        source=f"faiss_rebuild_request:{client_host}",
+        path=str(request.url.path),
+    )
+    with _faiss_rebuild_lock:
+        return dict(faiss_rebuild_state)
+
 def build_parts_public(parts):
     """
     parts: list[dict] | None
@@ -851,16 +1430,22 @@ def build_parts_public(parts):
 def build_public_url(path: str) -> str:
     r2_bucket_url = os.getenv("R2_PUBLIC_URL")
     if not r2_bucket_url:
+        
         raise HTTPException(503, "R2 is not configured")
     return f"{r2_bucket_url}/{path}"
 
 
+
+
 if __name__ == "__main__":
+    print("🚀 insight.py ロード開始")
+
     import uvicorn
-    from insight import app
+
+    # app は上で FastAPI() として定義されている想定
     uvicorn.run(
         app,
         host="127.0.0.1",
         port=8000,
-        reload=False
+        reload=False,
     )
